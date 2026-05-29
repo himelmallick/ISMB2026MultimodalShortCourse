@@ -1,0 +1,1187 @@
+---
+title: "Module 1: Vertical Multimodal Integration using R"
+author: "Saptarshi Roy, Texas A&M University"
+date: "ISMB 2026, Washington DC" 
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+  html_document:
+    theme: readable
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    output_dir: '.'
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+> **ISMB 2026 Tutorial VT4, Multimodal Integration and Multimodal Causal Inference using R/Bioconductor.** This is Module 1 of three hands-on modules delivered in a single day. Module 1 covers vertical (multi-omics) integration, Module 2 covers horizontal (meta-analysis) integration, and Module 3 covers multiview mediation with Zentangler. Before starting, run the setup script once (`Rscript setup/install.R`) to install and load every package used across all three modules.
+
+# Setup
+
+Install the following R packages and set a random seed to get started.
+
+```{r pkgs, message = FALSE, warning=FALSE}
+## Load the following R packages
+### Global packages
+library(tidyverse) 
+library(ggplot2) 
+library(cowplot) 
+library(bayesplot) 
+library(dplyr) 
+library(ROCR)
+library(purrr)
+
+### For IntegratedLearner implementation
+library(caret) 
+library(SuperLearner) 
+options(java.parameters = "-Xmx8000m")
+gc()
+library(bartMachine)
+library(bartMachineJARs)
+library(IntegratedLearner) 
+
+### For JAFAR implementation
+library(jafar) 
+
+### For multiview implementation
+library(glmnet) 
+library(multiview) 
+
+### For BayesCOOP implementation
+library(BayesCOOP) 
+
+## Set a seed for reproducibility
+set.seed(123)
+```
+
+In this lab, we showcase examples of various integration paradigms (early, late, and intermediate fusion) using the R packages [`multiview`](https://cran.r-project.org/web/packages/multiview/index.html),
+[`IntegratedLearner`](https://github.com/himelmallick/IntegratedLearner),
+[`BayesCOOP`](https://github.com/himelmallick/BayesCOOP) and
+[`jafar`](https://github.com/niccoloanceschi/jafar).
+
+# Pregnancy Dataset (Continuous Response)
+
+We load the pregnancy dataset from the [IntegratedLearner GitHub
+repository](https://github.com/himelmallick/IntegratedLearner). This dataset has an independent **validation** set to facilitate model
+development and evaluation.
+
+In this dataset, we focus on predicting **time-to-labor onset** using multi-omics measurements from the immunome, metabolome, and proteome for a cohort of women who experienced spontaneous labor. The dataset, described in [Mallick et al. (2024)](https://pubmed.ncbi.nlm.nih.gov/38146838/), consists of repeated blood measurements collected during the final 100 days of pregnancy.
+
+To align with prior work (e.g., [Ding et al., 2022](https://www.pnas.org/doi/10.1073/pnas.2202113119)) and to simplify the modeling framework, we construct a cross-sectional sub-dataset by retaining only the first available measurement for each participant. We treat \underline{time-to-labor onset as a continuous outcome}.
+
+The resulting dataset represents an extreme *large-p-small-n* setting. The three molecular layers provide high-dimensional predictors with  
+- \( p_1 = 1141 \) single-cell immune features,  
+- \( p_2 = 3529 \) metabolites, and  
+- \( p_3 = 1317 \) proteins,  
+
+for a total of \( n_{\text{tot}} = 53 \) subjects. Similarly, we have $8$ subjects in the validation set with data on metabolite layer missing. 
+
+This high-dimensional structure motivates the use of integrative and regularized modeling approaches capable of borrowing strength across modalities while controlling overfitting.
+
+Each of these datasets comes with a structured list with three components that
+together represent a complete multi-omics (or multi-view) dataset:
+
+-   **`feature_table`** – A matrix of quantitative features such as
+    microbial taxa abundances, metabolite intensities, or other
+    high-dimensional predictors. In this representation, **columns
+    correspond to samples** and **rows correspond to features**. This
+    layout is compatible with the downstream modeling functions used in
+    this workflow.
+
+-   **`feature_metadata`** – A data frame of annotations that describe
+    each feature in `feature_table`. Typical metadata may include the
+    data modality (e.g., taxonomic group, biochemical category), pathway
+    membership, measurement platform, or other biological or technical
+    descriptors. This metadata enables view-specific analyses and
+    interpretation of model outputs.
+
+-   **`sample_metadata`** – A data frame of sample-level information
+    that accompanies `feature_table`. This typically includes the
+    outcome or phenotype of interest (e.g., clinical status), subject
+    identifiers, covariates such as age or batch variables, and any
+    grouping or stratification variables relevant for training and
+    validation. This component is essential for supervised modeling and
+    performance assessment.
+
+```{r load_data}
+## Load train data
+data_train <- get(load(url(
+  "https://raw.githubusercontent.com/himelmallick/IntegratedLearner/master/data/StelzerDOS.RData"
+)))
+
+## Load test data
+data_test <- get(load(url(
+  "https://raw.githubusercontent.com/himelmallick/IntegratedLearner/master/data/StelzerDOS_valid.RData"
+)))
+
+## How many layers and how many features per layer?
+table(data_train$feature_metadata$featureType)
+
+## Explore data dimension of feature_table: no. of features x no. of samples
+print(dim(data_train$feature_table))
+
+## How do the components look like?
+print(data_train$feature_metadata[c(1:5, 1441:1445, 2758:2762), ])
+head(data_train$feature_table[1:5, 1:5])
+head(data_train$sample_metadata[1:5, ])
+```
+
+## Preprocessing the Dataset
+
+For simplicity, we remove **Metabolomics** features because they are not
+present in the validation set. We then realign the feature tables with
+the filtered metadata so that only valid rows and columns remain.
+Finally, we restrict the analysis to baseline samples only, selecting
+training samples labeled “A” and test samples labeled “G1.” This ensures
+that both the feature matrices and the sample metadata remain perfectly
+synchronized across datasets.
+
+**NOTE**: Although we take this step for the purpose of this tutorial,
+it is not strictly necessary. The [IntegratedLearner
+paper](https://pubmed.ncbi.nlm.nih.gov/38146838/) includes a case study
+demonstrating how to use all available data effectively, even when one
+modality is completely missing in the validation set. This example was
+also discussed during the lecture.
+
+```{r preprocess_data}
+## Removing Metabolomics
+data_train$feature_metadata <- data_train$feature_metadata %>%
+  filter(featureType != "Metabolomics")
+
+data_train$feature_table <- data_train$feature_table[
+  rownames(data_train$feature_metadata), , drop = FALSE
+]
+
+## Selecting baseline observations from train data
+pos_train <- grep("A", colnames(data_train$feature_table), ignore.case = TRUE)
+data_train$feature_table  <- data_train$feature_table[, pos_train, drop = FALSE]
+data_train$sample_metadata <- data_train$sample_metadata[pos_train, , drop = FALSE]
+
+## Selecting baseline observations from test data
+pos_test <- grep("G1", colnames(data_test$feature_table))
+data_test$feature_table   <- data_test$feature_table[, pos_test, drop = FALSE]
+data_test$sample_metadata <- data_test$sample_metadata[pos_test, , drop = FALSE]
+```
+
+To reduce noise and remove uninformative features, we filtered the data
+using predefined **abundance** and **prevalence** thresholds. Abundance
+filtering removes consistently negligible features, while prevalence
+filtering excludes features present in only a small fraction of samples.
+
+In our analysis, we set the abundance threshold to $0$, meaning no
+features were removed based on magnitude, and applied a prevalence
+threshold of $0.1$, retaining features observed in at least $10\%$ of
+samples. This reduces instability from extremely rare features while
+improving interpretability and computational efficiency.
+
+We will use three internal functions, `gen_datalist()`,
+`reconstruct_data()` and `filter_features()`, from the `BayesCOOP`
+package to carry out this preprocessing step. These functions are not
+exported but are designed to streamline data preparation within the
+modeling workflow. A brief description of each function is given below:
+
+-   `gen_datalist()`: This function takes as input a structured list
+    containing `feature_table`, `feature_metadata`, and
+    `sample_metadata`, and transforms it into the format required for
+    multi-view modeling. In particular, it partitions the feature table
+    according to predefined data views and returns an object where
+    `xList` is a list of feature matrices, with each element
+    corresponding to one data modality (or view). Each matrix in `xList`
+    contains the features for that specific view, aligned consistently
+    across samples. The function also retains the associated response
+    and metadata, ensuring that all components are properly synchronized
+    for downstream model fitting.
+
+-   `reconstruct_data()`: This function performs the inverse
+    transformation of `gen_datalist()`. It reconstructs the processed
+    data back into the original structured format (with `feature_table`,
+    `feature_metadata`, and `sample_metadata`) after intermediate
+    transformations, facilitating interpretation and further analysis.
+
+-   `filter_features()`: This function performs feature-level filtering
+    based on abundance and prevalence criteria. Given a feature matrix
+    `x` (with samples in rows and features in columns), it first retains
+    only those features whose values exceed a specified abundance
+    threshold in more than a given proportion of samples (the prevalence
+    threshold). This removes rare or sparsely observed features that may
+    introduce noise or instability in downstream modeling. It then
+    applies `caret::nearZeroVar()` to eliminate features with near-zero
+    variance, further reducing uninformative predictors. The function
+    returns the filtered feature matrix.
+
+```{r}
+## Filtering features according to abundance and prevalence threshold
+xList_train <- BayesCOOP:::gen_datalist(data_train)$xList
+y_train <- BayesCOOP:::gen_datalist(data_train)$y
+xList_test <- BayesCOOP:::gen_datalist(data_test)$xList
+y_test <- BayesCOOP:::gen_datalist(data_test)$y
+abd_thresh <- 0; prev_thresh <- 0.1
+xList_train <- lapply(xList_train, function(foo) BayesCOOP:::filter_features(foo, abd_thresh, prev_thresh))
+xList_test <- lapply(xList_test, function(foo) BayesCOOP:::filter_features(foo, abd_thresh, prev_thresh))
+
+## Considering the common features between train and test set
+keep_features <- vector("list", length = length(xList_train))
+for(i in 1:length(keep_features)) {
+  keep_features[[i]] <- intersect(names(xList_train[[i]]), names(xList_test[[i]]))
+  xList_train[[i]] <- as.matrix(xList_train[[i]][, keep_features[[i]], drop = FALSE])
+  xList_test[[i]] <- as.matrix(xList_test[[i]][, keep_features[[i]], drop = FALSE])
+}
+
+## Reconstructing the train and testing data object
+data_train_processed <- BayesCOOP:::reconstruct_data(xList_train, y_train)
+data_test_processed <- BayesCOOP:::reconstruct_data(xList_test, y_test)
+
+## Change column name to make it uniform across all packages henceforth
+colnames(data_train_processed$sample_metadata)[1] <- "subjectID"
+colnames(data_train_processed$feature_metadata) <- c("featureID", "featureType")
+colnames(data_test_processed$sample_metadata)[1] <- "subjectID"
+colnames(data_test_processed$feature_metadata) <- c("featureID", "featureType")
+
+## Check new dimensions after filtering of features
+print(dim(data_train_processed$feature_table))
+print(dim(data_test_processed$feature_table))
+```
+
+## Integrated Learner using `IntegratedLearner` R Package
+
+`IntegratedLearner` late fusion algorithm proceeds by 1) fitting a
+machine learning algorithm per-layer to predict outcome (`base_learner`)
+and 2) combining the layer-wise cross-validated predictions using a meta
+model (`meta_learner`) to generate final predictions based on all
+available data points. As a default choice, we recommend `SL.nnls.auc`
+as the meta model algorithm. It fits a non-negative least squares (in
+case of continuous outcome) and rank loss minimization (in case of
+binary outcome) on layer-wise cross-validated predictions to generate
+the final predictions and quantify per-layer contribution in the final
+predictions. For further details, see [the
+paper](https://pubmed.ncbi.nlm.nih.gov/38146838/).
+
+The default base model recommendation for `IntegratedLearner` is
+Bayesian additive regression trees or BART (`base_learner='SL.BART'`).
+Using BART as base-model yields uncertainty estimates (i.e. credible
+intervals) of the prediction and model parameters in addition to
+reporting a small set of interpretable features for follow-up
+experiments (i.e. feature importance scores).
+
+Below we briefly describe the main arguments controlling model fitting
+and integration in `IntegratedLearner()`:
+
+-   **`base_learner`**\
+    The algorithm used to fit a model for each data view. Each view is
+    modeled separately before integration. The default `"SL.BART"`
+    provides uncertainty estimates, but here we use `"SL.randomForest"`
+    for speed.
+
+-   **`base_screener`**\
+    Controls whether features are pre-filtered before fitting each base
+    learner. `"All"` (default) uses all features with no screening.
+
+-   **`meta_learner`**\
+    The algorithm that combines base learner predictions across views in
+    the stacked model. The default `"SL.nnls.auc"` fits a constrained
+    least squares or rank-loss model to yield final integrated
+    predictions.
+
+-   **`run_concat`**\
+    If `TRUE`, fits an early fusion model by concatenating all views
+    into one learner.
+
+-   **`run_stacked`**\
+    If `TRUE`, runs the stacked late-fusion model with the specified
+    `meta_learner`.
+
+-   **`refit.stack`**\
+    When `TRUE`, refits the stacked model on the full training data
+    after cross-validation; `FALSE` returns predictions based on the
+    original CV fits.
+
+-   **`verbose` / `print_learner`**\
+    Control console output during fitting: `verbose` shows progress
+    messages, `print_learner` prints the learner summary.
+
+```{r IL, message=FALSE, warning=FALSE}
+## Fit IntegratedLearner
+fit_IntegratedLearner <- IntegratedLearner(
+      feature_table = data_train_processed$feature_table,
+      sample_metadata = data_train_processed$sample_metadata,
+      feature_metadata = data_train_processed$feature_metadata,
+      feature_table_valid = data_test_processed$feature_table,
+      sample_metadata_valid = data_test_processed$sample_metadata,
+      folds = 5,
+      seed = 123,
+      base_learner = "SL.randomForest",
+      base_screener = "All",
+      meta_learner = "SL.nnls.auc",
+      run_concat = TRUE,
+      run_stacked = TRUE,
+      verbose = FALSE,
+      print_learner = TRUE,
+      refit.stack = TRUE,
+      family = gaussian()
+    )
+```
+
+### Prediction performance
+
+Below we evaluate predictive accuracy on the held-out test set using
+both early fusion and late (stacked) fusion results from
+`IntegratedLearner`. We compute the predicted values of the outcome and
+then quantify performance using mean squared prediction error (MSPE),
+which measures the average squared difference between predicted and true
+values. Lower MSPE indicates better predictive performance.
+
+```{r, IL_pp}
+## Prediction values of Y for both early and late fusion schemes
+y_pred_early <- fit_IntegratedLearner$yhat.test$concatenated
+y_pred_late <- fit_IntegratedLearner$yhat.test$stacked
+
+## Calculation of mean squared prediction error
+mspe_IL_early <- mean((y_pred_early - y_test)^2)
+print(mspe_IL_early)
+mspe_IL_late <- mean((y_pred_late - y_test)^2)
+print(mspe_IL_late)
+```
+
+## Cooperative Learning using `multiview` R Package
+
+The `multiview` package implements a supervised learning framework known
+as *cooperative learning* for multi-view data integration. In this
+setting, the goal is to learn a predictive model from multiple feature
+sets (or “views”) that may represent different data modalities (e.g.,
+taxa abundances, metabolite levels, clinical measures). Rather than
+fitting each view independently or naïvely concatenating all views,
+cooperative learning balances two objectives: (1) minimizing the
+prediction loss (such as squared error for continuous outcomes or
+deviance for generalized models), and (2) encouraging the predicted
+responses from different views to *agree* with each other.
+
+To achieve this, the method introduces an *agreement penalty* whose
+strength is controlled by a tuning parameter $\rho$. When $\rho$ is
+small, the views are fit more independently (similar to early fusion).
+As $\rho$ increases, the views are forced to produce more similar
+predictions, leading toward a late fusion (or consensus) solution. By
+varying $\rho$, the method traces a continuum of models that interpolate
+between independent and fully cooperative fits, allowing the data to
+determine the degree of agreement that best balances individual view
+performance and cross-view coherence.
+
+In addition, cooperative learning integrates a *sparsity-inducing
+penalty* (ridge, lasso and elastic net) with the agreement penalty. This
+combined penalty not only promotes agreement across views but also
+yields interpretable models by selecting a subset of relevant features
+from each view. The resulting framework is flexible and well-suited for
+high-dimensional multi-view settings where views may contain redundant
+or noisy predictors.
+
+If we assume that we have `M` data matrices
+$X_1 \in \mathbb R^{n\times p_1},X_2\in \mathbb R^{n\times p_2},\ldots, X_M\in \mathbb R^{n\times p_M}$,
+`multiview` essentially solves the problem
+$$\frac{1}{2} ||y- \sum_{m=1}^{M} X_m\rho_m||^2+  \frac{\rho}{2}\sum_{m<m'} ||(X_m\rho_m- X_{m'}\rho_{m'})||^2 + \sum_{m=1}^{M} \lambda_m \Bigl[(1-\alpha)\|\rho_m||_1 + \alpha||\rho_m||_2^2/2\Bigr].$$
+
+We will be using the following two functions to run `multiview` workflow
+for different fusion schemes.
+
+-   `cvfit_alpha()`: A helper function that runs **cross-validation**
+    for the `multiview` model to select the optimal regularization
+    parameter (`lambda`) for a given agreement penalty (`rho`). It takes
+    a list of view-specific feature matrices (`xlist`), the outcome
+    vector `y`, the agreement parameter `rho`, and optional arguments
+    for the elastic net mixing parameter (`alpha`) and number of folds.
+    The function returns the value of `lambda` that minimizes the
+    cross-validated loss, which is used in downstream model fitting.
+
+-   `fit_multiview()`: A wrapper function that encapsulates the workflow
+    of training, evaluating, and extracting results from a `multiview`
+    cooperative learning model for a specific fusion scheme. Given train
+    and test data (feature lists and outcome vectors) and a fusion
+    parameter `rho`, it first labels the fusion scheme (Early /
+    Intermediate / Late), selects the best tuning parameter using
+    `cvfit_alpha()`, and fits the `multiview` model. It then generates
+    predictions on the test set and computes **mean squared prediction
+    error (MSPE)**. The function also extracts the model coefficients,
+    counts the number of selected (non-zero) features (excluding the
+    intercept), and returns a tidy data frame of non-zero coefficients
+    with associated feature names, view labels, and fusion scheme
+    identifiers. The output is a list containing the fitted model
+    object, predictions, MSPE, selected feature count, and the non-zero
+    coefficient table for downstream analyses or visualization.
+
+```{r coop}
+## Function to choose lambda using cross validation
+cvfit_alpha <- function(xlist, y, rho, alpha = 1, folds = 5) {
+  cvfit <- multiview::cv.multiview(x_list = xlist, y = y, rho = rho, alpha = alpha, nfolds = folds)
+  list(lambda_min = cvfit$lambda.min)
+}
+
+## Function that outlines the workflow to 
+## run multiview for different fusion schemes
+fit_multiview <- function(xList_train, y_train, xList_test, y_test, rho, alpha = 1){
+  # Extracting the fusion scheme
+  if(rho == 0)
+    scheme_label = "Early"
+  else if(rho == 0.5)
+    scheme_label = "Intermediate"
+  else
+    scheme_label = "Late"
+  
+  # Cross-validate to choose best lambda
+  cvres      <- cvfit_alpha(xList_train, y_train, rho = rho, alpha = alpha)
+  best_lambda <- cvres$lambda_min
+
+  # Fit multiview at chosen lambda
+  fit_mv <- multiview::multiview(
+    xList_train, y_train,
+    lambda = best_lambda,
+    rho    = rho,
+    alpha  = 1
+  )
+  
+  # Predictions on the test set
+  y_pred_mv <- predict(
+    fit_mv,
+    newx  = xList_test,
+    s     = best_lambda,
+    rho   = rho,
+    alpha = 1
+  )
+
+  # Compute MSPE
+  mspe_mv <- mean((y_pred_mv - y_test)^2)
+
+  # Extract coefficients
+  coefs_mv <- coef(
+    fit_mv,
+    s     = best_lambda,
+    rho   = rho,
+    alpha = 1
+  )
+  
+  # Count nonzero (exclude intercept)
+  n_nonzero_mv <- sum(coefs_mv != 0) - 1
+
+  # Tidy into a data frame
+  coef_df <- as.data.frame(as.matrix(coefs_mv))
+  coef_df$feature <- rownames(coef_df)
+
+  nonzero_coefs <- coef_df %>%
+  tidyr::pivot_longer(
+    cols     = -feature,
+    names_to = "coef_column",
+    values_to = "coefficient"
+  ) %>%
+  dplyr::filter(coefficient != 0, feature != "(Intercept)") %>%
+  dplyr::mutate(
+    # Map feature to its view (e.g., proteomics, CyTOF)
+    view = data_train_processed$feature_metadata$featureType[
+      match(feature, data_train_processed$feature_metadata$featureID)
+    ],
+    method = scheme_label,
+    rho    = rho
+  ) %>%
+  dplyr::select(feature, view, coefficient, method, rho)
+
+  return(list(fit_mv = fit_mv, y_pred_mv = y_pred_mv, mspe_mv = mspe_mv, n_nonzero_mv = n_nonzero_mv, nonzero_coefs = nonzero_coefs))
+}
+
+## Different rho values for choice of fusion schemes
+rhos_to_try <- c("Early" = 0, "Intermediate" = 0.5, "Late" = 1)
+```
+
+```{r}
+set.seed(123)
+## Matrix datatype conversion
+xList_train <- lapply(xList_train, as.matrix)
+xList_test <- lapply(xList_test, as.matrix)
+
+## Run multiview for Early fusion
+fit_mv_early <- fit_multiview(xList_train, y_train, xList_test, y_test, rho = 0)
+
+## Run multiview for Late Fusion
+fit_mv_late <- fit_multiview(xList_train, y_train, xList_test, y_test, rho = 1)
+
+## Run multiview for Intermediate Fusion
+fit_mv_intermediate <- fit_multiview(xList_train, y_train, xList_test, y_test, rho = 0.5)
+```
+
+### Prediction performance
+
+Here, we outline the summary of predictive performance of cooperative
+learning across different fusions.
+
+```{r coop-results}
+## View prediction performance results
+multiview_summary <- data.frame(method = c("Early", "Late", "Intermediate"), mspe = c(fit_mv_early$mspe_mv, fit_mv_late$mspe_mv, fit_mv_intermediate$mspe_mv), nonzero_features = c(fit_mv_early$n_nonzero_mv, fit_mv_late$n_nonzero_mv, fit_mv_intermediate$n_nonzero_mv))
+print(multiview_summary)
+```
+
+### Feature Selection Comparison
+
+```{r coop-feature-selection}
+## Extract coefficients for multiview, early fusion
+nonzero_coef_mv_early <- fit_mv_early$nonzero_coefs
+
+### Order features by coefficient value
+nonzero_coef_mv_early_plot <- nonzero_coef_mv_early %>%
+  arrange(coefficient) %>%
+  mutate(feature = fct_reorder(feature, coefficient))
+
+### Plot
+p1 <- ggplot(nonzero_coef_mv_early_plot,
+       aes(x = feature,
+           y = coefficient,
+           fill = view)) +
+  geom_col(width = 0.7) +
+  labs(
+    title = "Non-Zero Regression Coefficients (Early Fusion)",
+    x = "Feature",
+    y = "Coefficient",
+    fill = "View"
+  ) +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 10),
+    plot.title = element_text(face = "bold")
+  )
+
+print(p1)
+
+## Extract coefficients for multiview, intermediate fusion
+nonzero_coef_mv_intermediate <- fit_mv_intermediate$nonzero_coefs
+
+### Order features by coefficient value
+nonzero_coef_mv_intermediate_plot <- nonzero_coef_mv_intermediate %>%
+  arrange(coefficient) %>%
+  mutate(feature = fct_reorder(feature, coefficient))
+
+### Plot
+p2 <- ggplot(nonzero_coef_mv_intermediate_plot,
+       aes(x = feature,
+           y = coefficient,
+           fill = view)) +
+  geom_col(width = 0.7) +
+  labs(
+    title = "Non-Zero Regression Coefficients (Intermediate Fusion)",
+    x = "Feature",
+    y = "Coefficient",
+    fill = "View"
+  ) +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 10),
+    plot.title = element_text(face = "bold")
+  )
+
+print(p2)
+
+## Extract coefficients for multiview, late fusion
+nonzero_coef_mv_late <- fit_mv_late$nonzero_coefs
+
+### Order features by coefficient value
+nonzero_coef_mv_late_plot <- nonzero_coef_mv_late %>%
+  arrange(coefficient) %>%
+  mutate(feature = fct_reorder(feature, coefficient))
+
+### Plot
+p3 <- ggplot(nonzero_coef_mv_late_plot,
+       aes(x = feature,
+           y = coefficient,
+           fill = view)) +
+  geom_col(width = 0.7) +
+  labs(
+    title = "Non-Zero Regression Coefficients (Late Fusion)",
+    x = "Feature",
+    y = "Coefficient",
+    fill = "View"
+  ) +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 10),
+    plot.title = element_text(face = "bold")
+  )
+
+print(p3)
+```
+
+## Bayesian Cooperative Learning using `BayesCOOP` R Package
+
+While the `multiview` package implements cooperative learning by
+combining prediction loss with an agreement penalty across multiple
+views, it does **not inherently provide uncertainty quantification
+(UQ)** for the fitted models or predictions. In many scientific
+applications, especially those involving high stakes or interpretation
+of effect sizes, simply reporting point estimates and predictive
+accuracy is not sufficient; one often also needs credible intervals,
+posterior distributions, or measures of confidence to assess the
+reliability of findings.
+
+`BayesCOOP` addresses this gap by placing a **Bayesian group
+spike-and-slab double exponential (Laplace) prior** on the coefficients,
+which encourages both sparsity and view-specific feature selection in a
+principled probabilistic framework. It combines fast maximum a
+posteriori (MAP) estimation with a **Bayesian Bootstrap** to approximate
+posterior sampling and enable scalable uncertainty estimation for both
+model parameters and predictions. This allows users to obtain credible
+intervals, posterior summaries of view agreement parameters, and
+measures of uncertainty that reflect uncertainty in the data and model
+fit, rather than only point estimates.
+
+Because of this Bayesian formulation, `BayesCOOP` not only selects
+relevant features and captures cooperative effects across views but also
+facilitates rigorous uncertainty quantification, which is important for
+interpretation and for downstream decision-making in applications where
+confidence in predictions matters. For further details, please refer to
+the
+[preprint](https://www.biorxiv.org/content/10.1101/2025.10.23.684056v1).
+
+### Fit `BayesCOOP` (Bayesian Bootstrap Enabled)
+
+Here we fit BayesCOOP using `bb = TRUE` to enable Bayesian
+Bootstrap–based uncertainty estimation. This step may take a while
+because it involves multiple bootstrap iterations, which can be adjusted
+through the `bbiters` and `bbburn` parameters. The output includes the
+posterior samples of the parameters and runtime.
+
+```{r fit_bb_true}
+set.seed(123)
+
+## Fitting BayesCOOP
+fit_BayesCOOP_bb_true <- BayesCOOP::BayesCOOP(data_train = data_train_processed,
+  family = "gaussian",
+  ss = c(0.05, 1),
+  group = TRUE,
+  bb = TRUE,
+  alpha_dirich = 1,
+  bbiters = 110,
+  bbburn = 10,
+  maxit = 100,
+  warning = TRUE,
+  verbose = FALSE,
+  control = list()
+)
+
+```
+
+### Fit `BayesCOOP` (Bayesian Bootstrap Disabled)
+
+We also run BayesCOOP again with `bb = FALSE` to obtain posterior mode
+estimates via a faster maximum a posteriori (MAP)-style variant (without bootstrap-based
+uncertainty). All other settings remain unchanged.
+
+```{r fit_bb_false}
+set.seed(123)
+
+## Fitting BayesCOOP with `bb` = FALSE
+fit_BayesCOOP_bb_false <- BayesCOOP::BayesCOOP(
+  data_train = data_train_processed,
+  family = "gaussian",
+  ss = c(0.05, 1),
+  group = TRUE,
+  bb = FALSE,
+  alpha_dirich = 1,
+  bbiters = 110,
+  bbburn = 10,
+  maxit = 100,
+  warning = TRUE,
+  verbose = FALSE,
+  control = list(rho = 0.5)
+)
+
+## Prediction
+pred_BayesCOOP_bb_false <- predict(object = fit_BayesCOOP_bb_false,
+                                            newdata = data_test_processed, family = "gaussian",
+                                            bb = FALSE, warning = TRUE, verbose = TRUE)
+
+## Calculating mean squared prediction error
+mspe_BayesCOOP_bb_false <- mean((pred_BayesCOOP_bb_false$y_pred - pred_BayesCOOP_bb_false$y_valid) ^ 2)
+print(mspe_BayesCOOP_bb_false)
+```
+
+### Prediction Performance
+
+```{r bayescoop-pp}
+## Prediction when bb is TRUE
+pred_BayesCOOP_bb_true <- predict(object = fit_BayesCOOP_bb_true,
+                                            newdata = data_test_processed, family = "gaussian",
+                                            bb = TRUE, warning = TRUE, verbose = TRUE)
+
+## Calculating mean squared prediction error when bb is TRUE
+mspe_BayesCOOP_bb_true <- mean((pred_BayesCOOP_bb_true$y_pred - pred_BayesCOOP_bb_true$y_valid) ^ 2)
+print(mspe_BayesCOOP_bb_true)
+
+## Prediction when bb is FALSE
+pred_BayesCOOP_bb_false <- predict(object = fit_BayesCOOP_bb_false,
+                                            newdata = data_test_processed, family = "gaussian",
+                                            bb = FALSE, warning = TRUE, verbose = TRUE)
+
+## Calculating mean squared prediction error when bb is FALSE
+mspe_BayesCOOP_bb_false <- mean((pred_BayesCOOP_bb_false$y_pred - pred_BayesCOOP_bb_false$y_valid) ^ 2)
+print(mspe_BayesCOOP_bb_false)
+
+```
+
+### Feature Selection / Sparsity Comparison
+
+We now count the number of **selected (nonzero) features** for each
+method to compare their **sparsity** and **selection aggressiveness**.
+
+```{r pp_bcoop}
+## Number of features selected for BayesCOOP with `bb` = TRUE
+n_nz_BayesCOOP_bb_true  <- sum(fit_BayesCOOP_bb_true$beta_postmed!=0)
+## Number of features selected for BayesCOOP with `bb` = FALSE
+n_nz_BayesCOOP_bb_false <- sum(fit_BayesCOOP_bb_false$beta_MAP!=0)
+## Number of features selected for multiview
+sparsity_table <- rbind(
+  data.frame(method = "BayesCOOP (bb=TRUE)",  n_selected_feat = n_nz_BayesCOOP_bb_true),
+  data.frame(method = "BayesCOOP (bb=FALSE)", n_selected_feat = n_nz_BayesCOOP_bb_false)
+)
+
+## Print table comparing the number of selected features for diff methods
+sparsity_table
+```
+
+Finally, we examine the features selected by `BayesCOOP`. For this
+tutorial, we focus on the results obtained with `bb = TRUE`, since this
+setting provides uncertainty quantification in addition to point
+estimates, allowing us to assess both feature selection and associated
+variability.
+
+```{r feature_selection_bcoop}
+# Posterior medians (already extracted)
+beta_postmed <- fit_BayesCOOP_bb_true$beta_postmed
+nonzero_pos  <- which(beta_postmed != 0)
+
+coef_est <- beta_postmed[nonzero_pos]
+
+# Posterior samples for selected coefficients
+beta_postsamp <- fit_BayesCOOP_bb_true$beta_samples
+postsamp_sel  <- beta_postsamp[, nonzero_pos]
+
+# Compute credible intervals
+q1 <- apply(postsamp_sel, 2, quantile, 0.025)
+q3 <- apply(postsamp_sel, 2, quantile, 0.975)
+
+# Create tidy dataframe
+df_BayesCOOP <- data.frame(
+  feature     = names(coef_est),
+  coefficient = coef_est,
+  q1          = q1,
+  q3          = q3
+)
+
+df_BayesCOOP <- df_BayesCOOP %>%
+  mutate(
+    view = data_train_processed$feature_metadata$featureType[
+      match(feature, data_train_processed$feature_metadata$featureID)
+    ]
+  ) %>%
+  arrange(view, coefficient) %>%                         # optional: group ordering by view
+  mutate(feature = fct_reorder(feature, coefficient))     # order bars by coefficient
+
+p4 <- ggplot(df_BayesCOOP,
+             aes(x = feature, y = coefficient, fill = view)) +
+  geom_col(width = 0.7) +
+  geom_errorbar(aes(ymin = q1, ymax = q3),
+                width = 0.2,
+                color = "black",
+                linewidth = 0.6) +
+  coord_flip() +
+  labs(
+    title = "BayesCOOP Selected Coefficients with 95% Credible Intervals",
+    x = "Feature",
+    y = "Coefficient",
+    fill = "View"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold")
+  )
+
+
+print(p4)
+```
+
+## Factor Model Based Multiview Learning Approach using `jafar` R Package
+
+Thus far, we integrated multiple views directly in the observed feature
+space. Multiview factor models instead posit that each modality is
+driven by a smaller set of latent factors, separating shared cross-view
+signal from view-specific variation. This structured decomposition
+provides a principled and interpretable framework for multimodal
+integration.
+
+The `jafar` package implements two supervised Bayesian factor modeling
+approaches for multi-view data integration:
+
+-   **Joint Factor Regression (**$\texttt{JFR}$): a baseline model that
+    captures the combined variation across multiple data views using a
+    single set of latent factors.
+    $$\mathbf{x}_{mi} = \boldsymbol{\mu}_{m} + \boldsymbol{\Lambda}_{m}\boldsymbol{\eta}_{i} + \boldsymbol{\varepsilon}_{mi}\\y_{i} = \mu_{y} + \boldsymbol{\theta}^{\top}\boldsymbol{\eta}_{i} + e_{i}$$
+-   **Joint Additive Factor Regression (**$\texttt{JAFAR}$): a more
+    refined model that explicitly decomposes variation into shared and
+    view-specific components. 
+    $$\mathbf{x}_{mi} = \boldsymbol{\mu}_{m} + \boldsymbol{\Lambda}_{m}\boldsymbol{\eta}_{i} + \mathbf{\Gamma}_{m}\boldsymbol{\phi}_{mi}  + \boldsymbol{\varepsilon}_{mi}$$
+    $$y_{i} = \mu_{y} + \Sigma_{m=1}^{M}\boldsymbol{\theta}^{\top}_{m}\boldsymbol{\phi}_{mi} + \boldsymbol{\theta}^{\top}\boldsymbol{\eta}_{i} + e_{i}$$
+where $\mathbf{x}_{mi}\in \mathbb{R}^{p_{m}}, \mathbf{\Lambda}_{m}\in \mathbb{R}^{p_{m}\times K}, \boldsymbol{\eta}_{i}\in \mathbb{R}^{K}, \boldsymbol{\Gamma}_{m}\in \mathbb{R}^{p_{m}\times K_{m}}$ and $\boldsymbol{\phi}_{mi}\in \mathbb{R}^{K_{m}}$.
+
+Isolating variation unique to each data modality, whether representing
+genuine biological signal or measurement artifact, can be particularly
+advantageous in high-dimensional settings. This separation enhances
+interpretability and improves scalability.
+
+$\texttt{JAFAR}$ enforces proper decomposition of additive components by
+assigning zero prior mass to configurations that yield ill-posed
+allocations of view-specific factors into the shared component.
+
+Both models leverage extensions of the $\texttt{CUSP}$ prior
+[(Legramanti et al.,
+2020)](http://academic.oup.com/biomet/article/107/3/745/5847840),
+learning adaptively the number of factors in a fully Bayesian way. The
+package implements independent $\texttt{CUSP}$ priors
+($\texttt{I-CUSP}$) for $\texttt{JFR}$ and dependent $\texttt{CUSP}$
+priors ($\texttt{D-CUSP}$) for $\texttt{JAFAR}$.
+
+In this tutorial, we focus on $\texttt{JAFAR}$ for ease of exposition.
+Using $\texttt{JFR}$ is completely analogous, simply replacing the
+function `gibbs_jafar()` with `gibbs_jfr()`\$.
+
+### Preprocess the Data for `jafar` Implementation
+
+```{r jafar-process}
+## Calculate the number of views
+views <- unique(data_train_processed$feature_metadata$featureType)
+m <- length(views)
+
+## pre-processing for jafar 
+y <- data_train_processed$sample_metadata$Y
+yTest <- data_test_processed$sample_metadata$Y
+
+## Scaling the predictors for bmlasso
+X_process <- lapply(xList_train, function(foo) as.matrix(scale(foo)))
+X_process_test <- lapply(xList_test, function(foo) as.matrix(scale(foo)))
+
+## centering the response
+y_process <- y - mean(y)
+y_process_test <- yTest - mean(yTest)
+```
+
+### Run `jafar`
+
+```{r jafar, message=FALSE}
+## Initialize Markov Chain Monte Carlo(MCMC) parameters for jafar
+tMCMC = 10000
+tBurnIn = 5000
+tThin = 10
+mcmc_seed=123
+K0 = 25
+K0_m = rep(20,m)
+
+## Jafar Implementation
+mcmc_supervised <- gibbs_jafar(X_process, y=y_process, K0=K0, K0_m=K0_m,
+                               tMCMC=tMCMC, tBurnIn=tBurnIn, tThin=tThin,
+                               hyperparams = list(seed = mcmc_seed))
+
+```
+
+### Prediction Performance
+
+We can then compute response predictions and assess predictive
+performance. Expected values and other distributional properties of
+$y_i \mid \{X_{m i}\}_m$ can be easily obtained leveraging the latent
+representation
+$$ \mathbb{E}[\,y_i \mid \{X_{m i}\}_m \,] =  \mathbb{E}\big[\, \mathbb{E}[\,y_i \mid \eta_i, \{\phi_{m i}\}_m \,] \mid \{X_{m i}\}_m  \big]$$
+This holds both for in-sample and out-of-sample observations.
+
+```{r, message=FALSE}
+## Prediction and mspe for jafar implemenation
+y_pred <- predict_y(X_process_test, mcmc_supervised)
+mspe_jafar <- mean((colMeans(y_pred$mean) - y_process_test)^2)
+print(mspe_jafar)
+```
+
+### Some visualization
+```{r jafar-vis}
+## Plot the loading matrices
+plot_loadings(mcmc_supervised, out_path = "~/Desktop/")
+```
+
+### Predictive Performance Comparison (MSPE) across different methods
+
+The plot below summarizes the mean squared prediction error (MSPE)
+across all methods evaluated in this lab for the StelzerDOS continuous
+outcome dataset. Lower MSPE indicates better predictive accuracy on the
+held-out test set.
+
+```{r compare-mspe-barplot, message=FALSE, warning=FALSE}
+# Compile all MSPEs into one tidy dataframe
+mspe_all <- tibble(
+  Method = c(
+    "multiview (Early)",
+    "multiview (Intermediate)",
+    "multiview (Late)",
+    "IntegratedLearner (Early)",
+    "IntegratedLearner (Late)",
+    "BayesCOOP (bb = TRUE)",
+    "BayesCOOP (bb = FALSE)",
+    "jafar"
+  ),
+  MSPE = c(
+    multiview_summary %>% filter(method == "Early") %>% pull(mspe),
+    multiview_summary %>% filter(method == "Intermediate") %>% pull(mspe),
+    multiview_summary %>% filter(method == "Late") %>% pull(mspe),
+    mspe_IL_early,
+    mspe_IL_late,
+    mspe_BayesCOOP_bb_true,
+    mspe_BayesCOOP_bb_false,
+    mspe_jafar
+  )
+)
+
+# Create the barplot
+ggplot(mspe_all, aes(x = fct_reorder(Method, MSPE), y = MSPE, fill = Method)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = round(MSPE, 3)), vjust = -0.5) +
+  coord_flip() +
+  labs(
+    title = "Comparison of Predictive Performance (MSPE)",
+    subtitle = "StelzerDOS continuous outcome",
+    x = "Method",
+    y = "Mean Squared Prediction Error"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 10),
+    plot.title = element_text(size = 14, face = "bold")
+  )
+```
+
+# PRiSM Dataset (Binary Response)
+
+While our main emphasis has been on continuous outcomes, the methodology
+is not restricted to the Gaussian setting. We now briefly demonstrate
+its application to a binary response.
+
+To do so, we load the PRiSM dataset from the IntegratedLearner GitHub
+repository, as described in the *IntegratedLearner* paper. This dataset
+includes an independent **validation set**, enabling integrative
+multi-omics modeling and rigorous out-of-sample evaluation.
+
+In this dataset, we consider the same raw gut microbiome multi-omics dataset used in [Franzosa et al. (2019)](https://pubmed.ncbi.nlm.nih.gov/30531976/), derived from the Prospective Registry in IBD Study at MGH (PRISM). The study was designed to characterize gut microbial composition and metabolic potential in individuals with inflammatory bowel diseases (IBD).
+
+Stool samples were collected from a cross-sectional discovery cohort of $155$ subjects, including $68$ individuals with Crohn’s disease (CD), $53$ with ulcerative colitis (UC), and $34$ non-IBD controls. The CD and UC groups are collectively categorized as IBD. A separate validation cohort of $65$ subjects was also considered for out-of-sample assessment.
+
+Each stool sample underwent metagenomic sequencing, followed by profiling of microbial taxonomic composition and functional potential. After quality control, the dataset comprised a total of $9,171$ features across two molecular layers:
+
+- **Metabolomics layer:** $8,831$ features  
+- **Microbiome layer:** $340$ features  
+
+The resulting dataset represents a high-dimensional multi-omics setting, with substantially more features than subjects. This structure motivates integrative modeling approaches capable of combining complementary biological signals across layers while controlling for overfitting in a large-\( p \), small-\( n \) regime.
+
+Each dataset is structured as a list containing three coordinated
+components that together define a multi-view data object:
+
+-   **`feature_table`**: A matrix of high-dimensional molecular
+    measurements derived from multiple omics platforms (e.g., microbiome
+    profiles, metabolomics, proteomics, or other molecular assays). In
+    this representation, **rows correspond to features** (such as taxa,
+    metabolites, or proteins), and **columns correspond to samples**.
+    This orientation is compatible with the modeling functions
+    implemented in the IntegratedLearner workflow.
+
+-   **`feature_metadata`**: A data frame providing feature-level
+    annotations. These annotations describe the biological modality or
+    data view (e.g., microbial and metabolite) This metadata enables
+    modality-specific modeling, structured integration across views, and
+    interpretation of feature importance.
+
+-   **`sample_metadata`**: A data frame containing subject-level
+    **binary outcome** information corresponding to the columns of
+    `feature_table`.
+
+```{r load_PRISM}
+## Load data
+data_train = get(load(url("https://raw.githubusercontent.com/himelmallick/IntegratedLearner/master/data/PRISM.RData"))); rm(pcl)
+data_test = get(load(url("https://raw.githubusercontent.com/himelmallick/IntegratedLearner/master/data/NLIBD.RData"))); rm(pcl)
+
+## How many layers and how many features per layer?
+table(data_train$feature_metadata$featureType)
+
+## Explore data dimension of feature_table: no. of features x no. of samples
+print(dim(data_train$feature_table))
+
+```
+
+## Preprocessing the Dataset
+
+As in the previous analysis, we rely on three internal utility functions
+from the `BayesCOOP` package—`gen_datalist()`, `reconstruct_data()`, and
+`filter_features()`—to carry out the preprocessing pipeline.
+
+Specifically, `gen_datalist()` organizes the raw multi-view inputs into
+a structured list format compatible with downstream modeling. The
+`reconstruct_data()` function ensures consistent alignment of features
+and samples across modalities, preserving correspondence between
+predictors and outcomes. Finally, `filter_features()` performs
+feature-level screening to remove low-quality or uninformative
+variables, thereby stabilizing estimation and improving computational
+efficiency.
+
+Together, these functions standardize and streamline the data
+preparation step prior to model fitting.
+
+```{r PRISM_preprocess}
+## Filtering features according to abundance and prevalence threshold
+xList_train <- BayesCOOP:::gen_datalist(data_train)$xList
+y_train <- BayesCOOP:::gen_datalist(data_train)$y
+xList_test <- BayesCOOP:::gen_datalist(data_test)$xList
+y_test <- BayesCOOP:::gen_datalist(data_test)$y
+abd_thresh <- 0; prev_thresh <- 0.1
+xList_train <- lapply(xList_train, function(foo) BayesCOOP:::filter_features(foo, abd_thresh, prev_thresh))
+xList_test <- lapply(xList_test, function(foo) BayesCOOP:::filter_features(foo, abd_thresh, prev_thresh))
+
+## Considering the common features between train and test set
+keep_features <- vector("list", length = length(xList_train))
+for(i in 1:length(keep_features)) {
+  keep_features[[i]] <- intersect(names(xList_train[[i]]), names(xList_test[[i]]))
+  xList_train[[i]] <- as.matrix(xList_train[[i]][, keep_features[[i]], drop = FALSE])
+  xList_test[[i]] <- as.matrix(xList_test[[i]][, keep_features[[i]], drop = FALSE])
+}
+
+## Reconstructing the train and testing data object
+data_train_processed <- BayesCOOP:::reconstruct_data(xList_train, y_train)
+data_test_processed <- BayesCOOP:::reconstruct_data(xList_test, y_test)
+
+# Change column name to make it uniform across all packages henceforth
+colnames(data_train_processed$sample_metadata)[1] <- "subjectID"
+colnames(data_train_processed$feature_metadata) <- c("featureID", "featureType")
+colnames(data_test_processed$sample_metadata)[1] <- "subjectID"
+colnames(data_test_processed$feature_metadata) <- c("featureID", "featureType")
+
+## Check new dimensions after filtering of features
+print(dim(data_train_processed$feature_table))
+print(dim(data_test_processed$feature_table))
+```
+
+While the `IntegratedLearner` and `multiview` packages currently support
+binary outcomes, the `jafar` and `BayesCOOP` packages do not yet provide
+this functionality. We are actively working toward extending these
+frameworks to accommodate binary responses in future releases.
+
+## Integrated Learner using `IntegratedLearner` R Package
+
+```{r PRISM_IL, message=FALSE, warning=FALSE}
+## Fit IntegratedLearner
+fit_IntegratedLearner <- IntegratedLearner(
+      feature_table = data_train_processed$feature_table,
+      sample_metadata = data_train_processed$sample_metadata,
+      feature_metadata = data_train_processed$feature_metadata,
+      feature_table_valid = data_test_processed$feature_table,
+      sample_metadata_valid = data_test_processed$sample_metadata,
+      folds = 5,
+      seed = 123,
+      base_learner = "SL.randomForest",
+      base_screener = "All",
+      meta_learner = "SL.nnls.auc",
+      run_concat = TRUE,
+      run_stacked = TRUE,
+      verbose = FALSE,
+      print_learner = TRUE,
+      refit.stack = FALSE,
+      family = binomial()
+    )
+
+```
+
+### Prediction Performance
+
+```{r, PRISM_IL_pp}
+## Prediction values of Y for both early and late fusion schemes
+y_pred_early <- fit_IntegratedLearner$yhat.test$concatenated
+y_pred_late <- fit_IntegratedLearner$yhat.test$stacked
+```
+
+`IntegratedLearner` offers easily accessible and interpretable summary
+outputs including 1) computation time, 2) per-layer AUC/ $R^2$ scores on
+training and/or test data (if `feature_table_valid` and
+`sample_metadata_valid` are provided), 3) AUC/ $R^2$ metrics for stacked
+and concatenated model if `run_stacked=TRUE` and `run_concat=TRUE` and
+4) estimated per-layer weights from meta learner in stacked model.
+
+We can visualize the classification performance by constructing
+layer-wise ROC curves for both train and test set using `plot.learner()`
+function that takes `IntegratedLearner` object as input:
+
+```{r, warning=FALSE, fig.height=10, fig.width=7}
+plot.obj <- IntegratedLearner:::plot.learner(fit_IntegratedLearner)
+```
+
+## Cooperative Learning using `multiview` R Package
+
+```{r PRISM_coop}
+## Matrix datatype conversion
+xList_train <- lapply(xList_train, as.matrix)
+xList_test <- lapply(xList_test, as.matrix)
+
+## Different rho values for choice of fusion schemes
+rho = 0.5 # Intermediate Fusion
+
+## Run cross-validation to choose the best lambda (regularization strength)
+cvfit <- multiview::cv.multiview(x_list = xList_train, y = y_train, rho = rho, alpha = 1, nfolds = 5)
+## Plot the cross-validation curve
+plot(cvfit)
+## Extract the CV-selected optimal lambda (often minimizing CV error)
+best_lambda <- cvfit$lambda_min
+
+## Fit the multiview model on the training data 
+fit_mv <- multiview::multiview(
+  xList_train, y_train,
+  lambda = best_lambda,
+  rho = rho,
+  alpha = 1,
+  family = binomial()
+)
+
+## Predict responses on the test set.
+y_pred_mv <- predict(
+  fit_mv,
+  newx = xList_test,
+  s = best_lambda,
+  rho = rho,
+  alpha = 1
+)
+
+## Extract fitted coefficients at the selected lambda.
+coefs_mv <- coef(
+  fit_mv,
+  s = best_lambda,
+  rho = rho,
+  alpha = 1
+)
+
+## Count how many coefficients are nonzero, then subtract 1 to exclude intercept.
+n_nonzero_mv <- sum(rowSums(coefs_mv != 0) > 0) - 1  # Exclude the intercept
+print(n_nonzero_mv)
+```
+
+## Looking Ahead
+
+Looking ahead, **IntegratedLearner (IL)** is being expanded to accommodate survival and multiclass outcomes, broadening its applicability to time-to-event analyses and complex phenotypic classifications that are common in modern biomedical studies. These extensions will preserve IL’s uncertainty-aware design while enabling principled inference beyond binary and continuous endpoints.
+
+Together, **BayesCOOP**, **JAFAR**, and **IntegratedLearner** can be viewed as *Bayesian sisters* - each addressing a distinct fusion paradigm (intermediate, factor-based, and ensemble-based integration, respectively) within a coherent uncertainty quantification framework. In contrast, **multiview (cooperative learning)** serves as the frequentist cousin, conceptually connecting early, intermediate, and late fusion strategies across these paradigms.
+
+This evolving ecosystem provides a unified statistical language for multimodal data integration, balancing interpretability, scalability, and rigorous uncertainty quantification across diverse outcome types.

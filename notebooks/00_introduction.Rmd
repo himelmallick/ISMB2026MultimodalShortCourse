@@ -1,0 +1,33 @@
+---
+title: "Introduction and Setup"
+author: "ISMB 2026 Multimodal Short Course"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction and Setup
+
+Welcome to the ISMB 2026 Multimodal Short Course. This notebook checks your R/Bioconductor environment and previews the course.
+
+## Setup
+
+```{r load-helpers}
+# Load shared helpers (uses the 'here' package to locate the repo root)
+source(here::here("R", "utils.R"))
+cat("Environment OK. Data dir:", data_path(), "\n")
+```
+
+## Content
+
+_Add your material for this module here._
+
+```{r content}
+# Your code here
+```

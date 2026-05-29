@@ -1,0 +1,768 @@
+---
+title: "Module 2: Horizontal Integration (Meta-Analysis)"
+author: "Sreya Sarkar, University of Iowa"
+date: "ISMB 2026, Washington DC" 
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+  html_document:
+    theme: readable
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    output_dir: '.'
+  header-includes:
+  - \DeclareUnicodeCharacter{2212}{-}
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+> **ISMB 2026 Tutorial VT4, Multimodal Integration and Multimodal Causal Inference using R/Bioconductor.** This is Module 2 of three hands-on modules delivered in a single day. Having covered vertical (multi-omics) integration in Module 1, we now turn to horizontal integration, combining evidence across studies that share a common feature space. Module 3 will close the day with multiview mediation using Zentangler. If you have not already done so, run the setup script once (`Rscript setup/install.R`) to install and load every package used across all three modules.
+
+## Setup
+
+Install the following R packages to get started.
+
+```{r R-libs, message = FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## Global Packages for data availability and/or visualization/demonstration
+library(curatedMetagenomicData) ## source: Bioconductor
+library(cowplot) ## source: CRAN
+library(ggplot2) ## source: CRAN
+library(ggpubr) ## source: CRAN
+library(dplyr) ## source: CRAN
+library(tidyverse) ## source: CRAN
+library(parallel) ## Base R package
+
+## For MMUPHin
+library(vegan) ## source: CRAN
+library(MMUPHin) ## source: Bioconductor
+
+## For Network visualization
+library(SpiecEasi) ## source: Github, devtools::install_github("zdk123/SpiecEasi")
+library(SPRING) ## source: Github, devtools::install_github("GraceYoon/SPRING")
+library(igraph) ## source: CRAN
+library(NetCoMi)
+## source: Github
+# devtools::install_github("stefpeschel/NetCoMi", 
+#                          repos = c("https://cloud.r-project.org/",
+#                                    BiocManager::repositories()))
+
+## For muffinette
+library(muffinette) # source: Github, devtools::install_github("himelmallick/muffinette")
+```
+
+
+Meta-analysis, a form of horizontal integration, is a statistical analysis
+that combines the results of multiple scientific studies by appropriately
+weighting the individual study-specific effect sizes. A common meta-analytic
+combination strategy is to take a weighted average of the study-specific
+summary measures. In fixed-effects meta-analysis, the weights are based on
+the assumption that there is a single true parameter underlying all the studies,
+while in random-effects meta-analysis, the weights are based on a model where
+the true parameter varies across studies according to a probability
+distribution.
+
+Meta-analysis is particularly useful when individual studies are small,
+and a joint analysis of these studies can enhance the precision of
+effect size estimation and improve statistical power. Especially in
+microbiome studies, individual effect sizes from each study tend to be
+small. Only through meta-analysis can these small effects reach
+statistical significance. Therefore, by jointly analyzing these studies,
+we amplify the collective voice of the data, offering a more
+comprehensive understanding of the effects under investigation.
+
+In this discussion, we demonstrate the implementation of horizontal integration
+by utilizing publicly available cancer microbiome datasets from the
+R/Bioconductor package `curatedMetagenomicData`. Our demonstration comprises
+three components as follows:
+
+- [`MMUPHin`](https://www.bioconductor.org/packages/release/bioc/html/MMUPHin.html)(Meta-Analysis Methods with a Uniform Pipeline for Heterogeneity in microbiome studies) - [A Unimodal Framework]
+- [`muffinette`](https://github.com/himelmallick/muffinette)(Meta-Analysis of Differential Microbiome Networks) - [A Unimodal Framework]
+
+
+## Meta-analysis of cancer microbiome studies using relative abundance data (MMUPHin)
+
+In this section, we provide detailed examples of how to perform
+batch effect correction and meta-analytic differential abundance testing
+on publicly available cancer microbiome data from multiple studies using the
+R package `MMUPHin`. `MMUPHin` is a R/Bioconductor package designed for
+meta-analysis of microbiome taxonomic and functional profiles. It is agnostic
+to the data type and leverages another R/Bioconductor package, `MaAsLin2`, as a
+backend to conduct the meta-analysis. `MaAsLin2` is particularly
+designed to be applicable to various microbial community data types
+(taxonomy or functional profiles) and environments (human or otherwise).
+It is modular, including implementations of alternative
+normalization/transformation schemes and statistical models (e.g., for
+amplicon vs. shotgun metagenomic profiles). Leveraging this flexible
+framework under the hood, `MMUPHin` performs normalization, batch effect
+correction, and meta-analysis using the default random effects
+meta-regression.
+
+
+### Data Pre-processing 
+
+We use both the relative abundance data and the pathway abundance data from 5
+public datasets. First, let us look into the relative abundance data from the
+`curatedMetagenomicData` package. In this analysis, we will use two
+input files. The first input file is the relative abundance data file, which
+consists of **a feature-by-sample matrix**. The second input is
+**the metadata** associated with the relative abundance file, which includes the
+study names and combines overall response rate (ORR), progression-free survival
+at 12 months (PFS12), as well as the response to anti-PD-1 (anti_PD_1) as the
+response variable.
+
+
+```{r load-pkg-data, message=FALSE, warning=FALSE}
+
+######################
+# Load melanoma data #
+######################
+
+se_relative <- sampleMetadata |>
+  filter(study_name %in% c("FrankelAE_2017", "GopalakrishnanV_2018", "LeeKA_2022", 
+                         "MatsonV_2018", "PetersBA_2019", "WindTT_2020")) |>
+  returnSamples("relative_abundance", rownames = "short")
+
+```
+
+
+```{r prepare-input-data}
+
+##########################
+# Create sample metadata #
+##########################
+
+data_meta <- dplyr::select(as.data.frame(colData(se_relative)),
+                    c("study_name", "ORR", "PFS12", "anti_PD_1"))
+
+# Define response variable
+data_meta$resvar <- NA
+data_meta$anti_PD_1[data_meta$anti_PD_1 == "responder"] <- "yes"
+data_meta$anti_PD_1[data_meta$anti_PD_1 == "non_responder"] <- "no"
+data_meta$resvar[!is.na(data_meta$anti_PD_1)] <- data_meta$anti_PD_1[!is.na(data_meta$anti_PD_1)]
+data_meta$resvar[!is.na(data_meta$PFS12)] <- data_meta$PFS12[!is.na(data_meta$PFS12)]
+data_meta$resvar[!is.na(data_meta$ORR)] <- data_meta$ORR[!is.na(data_meta$ORR)]
+
+
+cat(sprintf("Before filtering samples: Total %d samples from %d studies.\n\n",
+            nrow(data_meta), length(unique(data_meta$study_name))))
+
+# Filter individuals without response variable
+data_meta <- data_meta[!is.na(data_meta$resvar), c("study_name", "resvar")]
+cat(sprintf("After filtering samples: Total %d samples from %d studies.\n\n",
+            nrow(data_meta), length(unique(data_meta$study_name))))
+
+
+# Convert the "study_name" to factor variable
+data_meta$study_name <- as.factor(data_meta$study_name)
+
+
+###########################
+# Create Species Features #
+###########################
+# Transpose the abundance matrix and change the value of abundance
+# data to proportion unit
+data_abd <- assay(se_relative)
+data_abd <- data_abd / 100
+
+# Match the individuals in the data_abd
+data_abd <- data_abd[, colnames(data_abd) %in% rownames(data_meta)]
+
+# Change the rownames names for variables of interest
+rownames(data_abd) <- sub('.*s__', '', rownames(data_abd))
+```
+
+
+To reduce noise and remove uninformative features, we filtered the data
+using predefined **abundance** and **prevalence** thresholds. Abundance
+filtering removes consistently negligible features, while prevalence
+filtering excludes features present in only a small fraction of samples.
+
+In our analysis, we set the abundance threshold to 0, meaning no
+features were removed based on magnitude, and applied a prevalence
+threshold of 0.1, retaining features observed in at least 10% of
+samples. This reduces instability from extremely rare features while
+improving interpretability and computational efficiency. For this purpose,
+we use the `filter_abdfeatures()` function from the R package `muffinette`.
+
+Next, we apply an additional step of filtering to remove features exhibiting
+little variability across samples. To achieve this,
+we utilize the `filter_varfeatures()` function from the R package `muffinette`.
+This function first eliminates the features with near-zero variance, and sorts
+the remaining features in decreasing order of variance. For computational
+efficiency, this function further allows the user to retain only
+the top $K$ most variable features.
+
+
+```{r study-wise-filtering-features}
+###############################
+# Study-wise feature filtering #
+###############################
+
+# Make sure abundance matrix columns are exactly the filtered samples
+# and in the same order as data_meta
+data_abd <- data_abd[, rownames(data_meta), drop = FALSE]
+
+# Optional sanity check
+stopifnot(all(colnames(data_abd) == rownames(data_meta)))
+
+# Split sample IDs by study
+samples_by_study <- split(rownames(data_meta), data_meta$study_name)
+
+# Apply filtering study-wise
+data_abd_filtered_list <- lapply(names(samples_by_study), function(study) {
+  
+  samp_ids <- samples_by_study[[study]]
+  
+  # Feature-by-sample matrix for one study
+  abd_study <- data_abd[, samp_ids, drop = FALSE]
+  
+  cat(sprintf(
+    "\nStudy: %s | Before filtering: %d samples on %d features.\n",
+    study, ncol(abd_study), nrow(abd_study)
+  ))
+  
+  # filter_abdfeatures expects sample-by-feature matrix
+  abd_study_filtered <- filter_abdfeatures(
+    x = t(abd_study),
+    abd_threshold = 0,
+    prev_threshold = 0.1)
+  
+  # filter variable features within the same study
+  abd_study_filtered <- filter_varfeatures(
+    x = abd_study_filtered,
+    topV = NULL)
+  
+  # Transpose back to feature-by-sample matrix
+  abd_study_filtered <- as.matrix(t(abd_study_filtered))
+  
+  cat(sprintf(
+    "Study: %s | After filtering: %d samples on %d features.\n",
+    study, ncol(abd_study_filtered), nrow(abd_study_filtered)
+  ))
+  
+  return(abd_study_filtered)
+})
+
+names(data_abd_filtered_list) <- names(samples_by_study)
+str(data_abd_filtered_list)
+
+## Pooled feature-by-sample matrix
+common_features <- Reduce(intersect, lapply(data_abd_filtered_list, rownames))
+
+data_abd_filtered_common_list <- lapply(data_abd_filtered_list, function(x) {
+  x[common_features, , drop = FALSE]
+})
+data_abd_filtered_common <- do.call(cbind, data_abd_filtered_common_list)
+
+dim(data_abd_filtered_common) 
+
+data_abd_filtered_common <- data_abd_filtered_common[, rownames(data_meta), drop = FALSE]
+
+stopifnot(all(colnames(data_abd_filtered_common) == rownames(data_meta)))
+```
+
+
+
+At the end of these steps, we have prepared the two required input files
+consisting of **285 samples of relative abundances on 121 features collected
+from 5 different studies**.
+
+
+
+### Performing batch (study) effect adjustment with adjust_batch for relative abundance {#sec-batch-effect-adjustment}
+
+Here, we will perform the batch effect correction analysis using the
+`adjust_batch` function from `MMUPHin`, adjusting for the response
+variable `resvar`. A brief description of the function
+arguments is as follows:
+
+- `feature_abd`: feature-by-sample matrix of abundances (proportions/counts)
+- `batch`: name of the batch variable (should be a factor variable included in
+the metadata)
+- `covariates`: names of covariates to adjust for in the batch-correction model
+- `data`: data frame of metadata, columns must include exposure and batch and
+covariates to adjust for (if specified)
+
+
+```{r batch-effect-corret}
+# Use adjust_batch to correct for differences in the five studies, while
+# controlling for the effect of cases versus control (variable resvar in data_meta).
+fit_adjust_batch <- MMUPHin::adjust_batch(feature_abd = data_abd_filtered_common,
+                                 batch = "study_name",
+                                 covariates = "resvar",
+                                 data = data_meta,
+                                 control = list(verbose = FALSE))
+
+data_abd_adj <- fit_adjust_batch$feature_abd_adj
+
+```
+
+By the end of this step, we obtain a feature-by-sample
+(`r dim(data_abd_adj)[1]` $\times$ `r dim(data_abd_adj)[2]`) batch-adjusted
+relative abundance matrix.
+
+
+
+### Evaluation for batch effect adjustment {#sec-batch-adjustment-evaluation}
+
+After obtaining the adjusted abundance matrix, we can evaluate the
+improvement of the batch effect adjustment. Here, the total variation
+from study difference will be assessed through the PERMANOVA$^14$ test, using
+the R package `vegan`.
+
+```{r permanovaTest}
+
+D_before <- vegan::vegdist(t(data_abd_filtered_common))
+D_after <- vegan::vegdist(t(data_abd_adj))
+
+set.seed(1)
+fit_adonis_before <- vegan::adonis2(D_before ~ study_name, data = data_meta)
+fit_adonis_after <- vegan::adonis2(D_after ~ study_name, data = data_meta)
+
+print(fit_adonis_before)
+print(fit_adonis_after)
+
+```
+
+Based on the results, we can see that the study differences can explain
+a total of `r round(fit_adonis_before$R2[1]*100, 1)`% ($R^2$) of the variability
+in microbial abundance profiles before study effect adjustment, whereas after
+adjustment this was reduced to `r round(fit_adonis_after$R2[1]*100, 1)`% ($R^2$). 
+
+Let us now visualize the results of the PERMANOVA test.
+
+```{r visualization-Permanova}
+
+##############
+# Ordination #
+##############
+# Before
+R2_before <- round(fit_adonis_before$R2[1]*100, 1)
+pcoa_before <- cmdscale(D_before, eig = TRUE)
+ord_before <- as.data.frame(pcoa_before$points)
+percent_var_before <- round(pcoa_before$eig / sum(pcoa_before$eig) * 100, 1)[1:2]
+before_labels <- c(paste('Axis 1 (', percent_var_before[1], '%)', sep = ''), 
+                 paste('Axis 2 (', percent_var_before[2], '%)', sep = ''))
+
+before_phrase <- paste('Before (PERMANOVA R2 = ', R2_before, '%)', sep = '')
+colnames(ord_before) <- c('PC1', 'PC2')
+ord_before$Study <- data_meta$study_name
+
+# After
+R2_after <- round(fit_adonis_after$R2[1]*100, 1)
+pcoa_after <- cmdscale(D_after, eig = TRUE)
+ord_after <- as.data.frame(pcoa_after$points)
+percent_var_after <- round(pcoa_after$eig / sum(pcoa_after$eig) * 100, 1)[1:2]
+after_labels <- c(paste('Axis 1 (', percent_var_after[1], '%)', sep = ''), 
+                paste('Axis 2 (', percent_var_after[2], '%)', sep = ''))
+
+after_phrase <- paste('After (PERMANOVA R2 = ', R2_after, '%)', sep = '')
+colnames(ord_after) <- c('PC1', 'PC2')
+ord_after$Study <- data_meta$study_name
+
+# Ordination Plot
+p_before <- ggplot(ord_before, aes(x = PC1, y = PC2, color = Study)) + 
+  geom_point(size = 4) + 
+  theme_bw() + 
+  xlab(before_labels[1]) + 
+  ylab(before_labels[2]) + 
+  ggtitle(before_phrase) + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  theme(legend.position ="none")
+
+p_after <- ggplot(ord_after, aes(x = PC1, y = PC2, color = Study)) + 
+  geom_point(size = 4) + 
+  theme_bw() + 
+  xlab(after_labels[1]) + 
+  ylab(after_labels[2]) + 
+  ggtitle(after_phrase) + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  theme(legend.position ="none")
+
+p <- plot_grid(p_before, p_after, ncol = 2)
+p
+
+```
+
+
+
+### Meta-analytical differential abundance testing with maaslin_meta {#sec-differential-abundance-testing}
+
+Here, we illustrate the details of the meta-analytical differential
+abundance testing through the `maaslin_meta` function provided by the `MMUPHin`
+packages with the following specifications:
+
+- `feature_abd`: feature-by-sample matrix of abundances (proportions/counts)
+- `batch`: name of the batch variable (should be a factor variable included in
+the metadata)
+- `exposure`: name of the exposure variable for differential abundance testing
+- `covariates`: names of covariates to adjust for in `MaAslin2` differential
+abundance testing models.
+- `covariates_random`: names of random-effects grouping covariates to adjust
+for in `MaAslin2` differential abundance testing models.
+- `data`: data frame of metadata, columns must include exposure and batch and
+covariates to adjust for (if specified)
+- `control`: a named list of additional parameters including normalization
+technique, transformation to use and analysis method. See `MaAsLin2` for details.
+Moreover, several choices of estimation method are available for fitting either a
+fixed-effects or a random-effects model for meta-analysis. Refer to `rma.uni()` in
+the R package `metafor`.
+
+Here, we apply the Tweedie model using the "CPLM" analysis
+method in `MaAsLin2` and pass it as part of control. 
+
+```{r Implement-mmuphin-DAtest, warning=FALSE}
+fit_maaslin_meta <- maaslin_meta(feature_abd = data_abd_adj,
+                       batch = "study_name",
+                       exposure = "resvar",
+                       data = data_meta,
+                       control = list(analysis_method = 'CPLM', transform = 'LOG'))
+
+meta_fits_mmuphin_abundance <- fit_maaslin_meta$meta_fits_abundance
+meta_fits_mmuphin_prevalence <- fit_maaslin_meta$meta_fits_prevalence
+
+signif_species_meta_abundance <- meta_fits_mmuphin_abundance[meta_fits_mmuphin_abundance$qval.fdr < 0.05, 1]
+signif_species_meta_prevalence <- meta_fits_mmuphin_prevalence[meta_fits_mmuphin_prevalence$qval.fdr < 0.05, 1]
+signif_species_meta_abundance
+signif_species_meta_prevalence
+```
+
+This step yields a data frame of per-feature meta-analytical differential abundance
+results, including columns for effect sizes, p-values and q-values, heterogeneity statistics such as $\tau^2$ and $I^2$, as well as weights for individual batches.
+More details of these statistics are included in `rma.uni()` in `metafor` package.
+
+
+Based on the results from `MMUPHin`, we observe that there are NO significant
+species.
+
+
+## Meta-network-analysis (muffinette)
+
+Microbial communities operate through complex ecological interactions that are
+better understood via network-based analyses. Many existing work in the
+literature (eg. SparCC, SpiecEasi etc.) construct microbial association networks
+within individual studies in order to capture interspecies relationships.
+`muffinette` is a novel statistical framework designed to meta-analyze such
+networks across studies to identify reproducible interaction patterns.
+
+After the pre-processing steps similar to those used in `MMUPHin`, including
+prevalence and variance-based filtering, and followed by adjustment of batch
+(study) effects, `muffinette` introduces the following additional steps of
+network-level connectivity modeling procedures, executed per study, prior to
+conducting meta-analysis across studies.
+
+(1) Estimation of within-study correlation networks
+(2) Calculation of feature-level connectivity scores
+(3) Calculation of feature-by-sample pseudovalue matrix
+
+Here, we demonstrate these steps for one study.
+
+```{r prepare-per-study-abd}
+batch_levels <- levels(as.factor(data_meta$study_name))
+exp_levels <- levels(as.factor(data_meta$resvar)) 
+
+## vector of sample sizes for different studies
+ni <- as.numeric(table(factor(data_meta$study_name, levels = batch_levels)))
+ni_ends <- cumsum(ni)
+ni_starts <- c(1, ni_ends[-length(ni)] + 1)
+
+## Consider the first study for demonstration
+## Extract the corresponding batch-corrected abundance matrix
+study1 <- batch_levels[1]
+data_abd_adj_all <- t(data_abd_adj)
+study1_abd <- data_abd_adj_all[ni_starts[1]:ni_ends[1], ]
+
+## extracting indices of two groups of response (No and Yes)
+groupA <- which(data_meta$resvar[data_meta$study_name == study1] == exp_levels[1])
+groupB <- which(data_meta$resvar[data_meta$study_name == study1] == exp_levels[2])
+
+
+## extracting the group-specific abundances
+xA <- study1_abd[groupA, , drop = FALSE]
+xB <- study1_abd[groupB, , drop = FALSE]
+
+
+## Remove the study from analysis if sample size is limited
+if(nrow(xA) < 5 | nrow(xB) < 5) {
+    message(sprintf("Skipping study %s: too few samples per
+    exposure (nA = %d, nB = %d)", studies[i], nrow(xA), nrow(xB)))
+    estimatedNet <- NULL
+    pseudoVal <- NULL
+}
+```
+
+
+```{r network-steps}
+fixseed <- 1
+ncores <- 4
+
+## Setting seed for reproducibility across parallel network estimations
+cl <- parallel::makeCluster(ncores)
+# on.exit(parallel::stopCluster(cl), add = TRUE)
+if(!is.null(fixseed)) {
+# ensure master uses reproducible parallel RNG
+RNGkind("L'Ecuyer-CMRG")
+set.seed(fixseed)
+
+# ensure workers use same RNG engine
+parallel::clusterEvalQ(cl, {
+    RNGkind("L'Ecuyer-CMRG")
+    NULL
+})
+
+# generate independent streams for workers
+parallel::clusterSetRNGStream(cl, iseed = fixseed)
+}
+
+parallel::clusterExport(cl, varlist = c("networkEst"),
+                envir = environment())
+
+
+## Estimation of feature-by-feature association matrix
+estimatedNet_groupA <- networkEst(x = xA,
+                                  estimethod = "SparCC",
+                                  iter = 20, inner_iter = 10, th = 0.1)
+estimatedNet_groupB <- networkEst(x = xB,
+                                  estimethod = "SparCC",
+                                  iter = 20, inner_iter = 10, th = 0.1)
+estimatedNet <- list(estimatedNet_groupA = estimatedNet_groupA,
+                     estimatedNet_groupB = estimatedNet_groupB)
+
+
+## global network-connectivity measurement
+thetahat_groupA <- measureNetwork(estimatedNet_groupA)
+thetahat_groupB <- measureNetwork(estimatedNet_groupB)
+
+
+## Estimation of feature-by-feature association matrix
+## leaving one-subject-out
+## using parLapply for computational efficiency
+clusterExport(cl, varlist = c("xA"),
+                        envir = environment())
+
+estimatedNet_loo_groupA <- parLapply(cl, X = seq_len(nrow(xA)),
+            fun = function(j) {
+                tryCatch(networkEst(x = xA[-j, , drop = FALSE],
+                        estimethod = "SparCC",
+                        iter = 20, inner_iter = 10, th = 0.1),
+                            error = function(e) e)})
+clusterExport(cl, varlist = c("xB"),
+                        envir = environment())
+
+estimatedNet_loo_groupB <- parLapply(cl, X = seq_len(nrow(xB)),
+            fun = function(j) {
+                tryCatch(networkEst(x = xB[-j, , drop = FALSE],
+                        estimethod = "SparCC",
+                        iter = 20, inner_iter = 10, th = 0.1),
+                            error = function(e) e)})        
+
+## global network-connectivity measurement leaving one-subject-out
+thetahat_loo_groupA <- sapply(estimatedNet_loo_groupA, measureNetwork)
+thetahat_loo_groupB <- sapply(estimatedNet_loo_groupB, measureNetwork)
+
+parallel::stopCluster(cl)
+rm(cl)
+```
+
+
+Let us visualize these two networks from the two groups
+using the `NetCoMi` package.
+
+```{r visualize-networks}
+net <- netConstruct(data = as.matrix(estimatedNet_groupA),
+                    data2 = as.matrix(estimatedNet_groupB),
+                    dataType  = "correlation", 
+                    sparsMethod = "threshold",
+                    dissFunc = "unsigned",
+                    thresh = 0.19,
+                    weighted  = TRUE,
+                    verbose = 0)
+
+A1 <- net$assoMat1 
+A2 <- net$assoMat2 
+
+g1 <- graph_from_adjacency_matrix(A1, mode="undirected", weighted=TRUE, diag=FALSE)
+g2 <- graph_from_adjacency_matrix(A2, mode="undirected", weighted=TRUE, diag=FALSE)
+
+# Layout graph with positive weights (abs), but keep original g1/g2 for plotting
+g1_layout <- g1
+E(g1_layout)$weight <- abs(E(g1_layout)$weight)
+
+L <- layout_with_fr(g1_layout) 
+
+# edge aesthetics using ORIGINAL sign
+E(g1)$color <- ifelse(E(g1)$weight > 0, "darkgreen", "red")
+E(g2)$color <- ifelse(E(g2)$weight > 0, "darkgreen", "red")
+E(g1)$width <- 1 + 4*abs(E(g1)$weight)
+E(g2)$width <- 1 + 4*abs(E(g2)$weight)
+
+
+par(mfrow=c(1,2), mar=c(1,1,2,1))
+plot(g1, layout=L, vertex.size=6, vertex.label=NA, main="Group 1 (No)")
+plot(g2, layout=L, vertex.size=6, vertex.label=NA, main="Group 2 (Yes)")
+
+# move to outer margin space
+par(xpd=NA)
+
+legend(x = -2.72, y = -1.15,
+       legend = c("Positive association", "Negative association"),
+       col = c("darkgreen", "red"),
+       lwd = 3,
+       horiz = TRUE,
+       inset = -0.001,
+       bty = "n",
+       cex = 1)
+par(mfrow=c(1,1), xpd=FALSE)
+```
+
+
+
+
+We now calculate the jackknife pseudovalues for the $i$-th subject and $k$-th
+feature as
+
+$$\tilde{\theta}_{ik} = n\hat{\theta}_k - (n-1)\hat{\theta}_{k(-i)}$$.
+
+We use the `pseudoValue` function from the `muffinette` package to do this task.
+The function takes the following arguments:
+
+* `thetahatinput` network measure of all subjects,
+* `thetahatdropinput` network measure leaving-one-subject-out,
+* `sizegroup` number of observations,
+
+and returns a sample-by-feature matrix of jackknife pseudovalues.
+
+
+```{r pseudovalues}
+## Calculation of jackknife pseudovalues
+pseudoVal_groupA <- pseudoValue(thetahat_groupA, thetahat_loo_groupA, nrow(xA))
+pseudoVal_groupB <- pseudoValue(thetahat_groupB, thetahat_loo_groupB, nrow(xB))
+pseudoVal <- matrix(NA, nrow(study1_abd), ncol(study1_abd))
+pseudoVal[groupA, ] <- pseudoVal_groupA
+pseudoVal[groupB, ] <- pseudoVal_groupB
+pseudoVal <- scale(pseudoVal, center = TRUE, scale = TRUE)
+
+## Maps the column names (feature names)
+colnames(pseudoVal) <- colnames(study1_abd)
+
+cat(sprintf("A sample-by-feature (%d x %d) matrix of
+jackknife pseudovalues for study %s:\n\n", nrow(pseudoVal),
+ncol(pseudoVal), study1))
+print(pseudoVal[1:4, 1:3])
+
+```
+
+We repeat the aforesaid steps for every study and construct a sample-by-feature
+(`r dim(data_abd_adj)[2]`$\times$ `r dim(data_abd_adj)[1]`) pseudovalue matrix.
+Finally, we perform meta-network-analysis of these pseudovalues across studies
+to discover consistent network-based signatures. The `muffinette` function in
+the R package `muffinette` implements this entire workflow as demonstrated below.
+
+```{r Implement-muffinette}
+###########################################
+# Study-wise abundance list without filter #
+###########################################
+
+# Make sure abundance matrix columns are exactly the filtered samples
+# and in the same order as data_meta
+data_abd <- data_abd[, rownames(data_meta), drop = FALSE]
+
+# Sanity check
+stopifnot(all(colnames(data_abd) == rownames(data_meta)))
+
+# Split sample IDs by study
+samples_by_study <- split(rownames(data_meta), data_meta$study_name)
+
+# Create study-wise feature-by-sample abundance matrices
+data_abd_list <- lapply(names(samples_by_study), function(study) {
+  
+  samp_ids <- samples_by_study[[study]]
+  
+  abd_study <- data_abd[, samp_ids, drop = FALSE]
+  
+  cat(sprintf(
+    "\nStudy: %s | %d samples on %d features.\n",
+    study, ncol(abd_study), nrow(abd_study)
+  ))
+  
+  return(abd_study)
+})
+
+names(data_abd_list) <- names(samples_by_study)
+
+str(data_abd_list)
+
+fit_muffinette <- muffinette(metaAbd = data_abd,
+                                    feature_abd_list = data_abd_list,
+                                    batchvar = data_meta$study_name,
+                                    exposurevar = data_meta$resvar,
+                                    metaData = data_meta,
+                                    prevfilter = TRUE, filter_perstudy = TRUE,
+                                    topfeatures = 100,
+                                    comp = TRUE, net.est.method = "SparCC",
+                                    covariates = NULL, covariates_random = NULL,
+                                    ncores = 4, verbose = TRUE, fixseed = NULL, control = NULL)
+
+meta_fits_muffinette <- fit_muffinette$metafits
+View(meta_fits_muffinette)
+signif_species_muffinette <- meta_fits_muffinette[meta_fits_muffinette$qval < 0.05, 1]
+```
+
+
+Let us now evaluate the results obtained by `muffinette`.
+
+```{r comparison}
+fig_muffinette <- meta_fits_muffinette %>%
+  filter(qval < 0.05) %>%
+  mutate(feature = sub("^species:", "", feature)) %>%
+  ggplot(aes(y = coef, x = reorder(feature, coef))) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  theme(axis.text.y = element_text(size = 5)) +
+  labs(y = "Estimated Coefficients", x = "Differentially Abundant Species", title = "muffinette")
+
+
+# fig <- ggarrange(fig_mmuphin, fig_muffinette, nrow = 2, heights = c(0.75, 1))
+# fig <- annotate_figure(fig,
+#                        left = text_grob("Differentially Abundant Species",
+#                                         size = 8, face = "bold", rot = 90),
+#                        bottom = text_grob("Estimated Coefficients",
+#                                           size = 8, hjust = 0.5, face = "bold"))
+fig_muffinette
+```
+
+
+
+* `muffinette` identifies 8 significant species in total, among which
+\emph{Phocaeicola dorei} has the strongest positive effect, whereas
+\emph{Collinsella aerofaciens} has the strongest negative effect. These features
+could only be detected by meta-analysis of the network-relationships within a
+microbiome community unlike `MMUPHin` which directly meta-analyzes relative
+abundances.
+
+
+
+
+
+
+## Session information
+
+```{r}
+sessionInfo()
+```
+

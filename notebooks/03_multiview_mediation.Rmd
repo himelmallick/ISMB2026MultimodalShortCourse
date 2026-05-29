@@ -1,0 +1,1722 @@
+---
+title: "Module 3: Multiview Mediation with Zentangler"
+author: "Himel Mallick, Cornell University"
+date: "ISMB 2026, Washington DC"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+  html_document:
+    theme: readable
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    output_dir: '.'
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+> **ISMB 2026 Tutorial VT4, Multimodal Integration and Multimodal Causal Inference using R/Bioconductor.** This is Module 3 of three hands-on modules delivered in a single day. Module 1 covered vertical (multi-omics) integration and Module 2 covered horizontal (meta-analysis) integration. In this final module we connect the exposure, the molecular layers, and the outcome through multiview mediation analysis with Zentangler. If you have not already done so, run the setup script once (`Rscript setup/install.R`) to install and load every package used across all three modules.
+
+# Module Overview
+
+Modules 1 and 2 asked two complementary questions. Vertical integration asked how multiple omics layers jointly predict an outcome. Horizontal integration asked which features are reproducibly associated with an outcome across studies. Module 3 asks a third, mechanistic question: when an exposure influences an outcome, which molecular features sit on the path between them, and in which view do they live?
+
+This is a mediation question. An exposure `X` may influence many candidate mediators spread across several omics or assay views, and those mediators may in turn be associated with an outcome `Y`. Zentangler is a `MultiAssayExperiment`-first R package built to answer exactly this question in the parallel multiview setting, screening and ranking mediators across all views at once while keeping the assay data, sample mapping, and phenotype variables in one coordinated container.
+
+By the end of this module you will be able to:
+
+1. State the parallel multiview mediation target and the A-path, B-path, and `score = a * b` quantities that Zentangler reports.
+2. Assemble omics layers and phenotype into a `MultiAssayExperiment` and fit a Zentangler model with sensible presets.
+3. Choose among early, intermediate, and late fusion, and among the available B-path inference and FDR options.
+4. Run a real applied analysis on autism spectrum disorder (ASD) multi-omics data, benchmark it against the single-view HIMA2 comparator, and validate behavior on simulated data with known ground truth.
+
+The module is organized in two parts. Part 1 is a guided walkthrough of the Zentangler interface using a small simulated object, so the moving parts are visible without waiting on long fits. The illustrative chunks in Part 1 are not executed during knitting, so they read as a reference you can run line by line at your own pace. Part 2 is a fully executed applied analysis on the ASD example data, followed by simulation checks that quantify recovery of known mediators.
+
+# Setup
+
+Module 3 uses the following packages, all installed by the setup script (`setup/install.R`):
+
+- `Zentangler` for multiview parallel mediation (source: GitHub, `himelmallick/Zentangler`).
+- `MultiAssayExperiment`, `SummarizedExperiment`, and `S4Vectors` for the multi-assay data container (source: Bioconductor).
+- `HIMA` for the single-view HIMA2 comparator (source: CRAN), used only in Part 2.
+
+Load them at the start of your session. The applied analysis in Part 2 loads them again in context so each part can be run on its own.
+
+# Part 1: Understanding Zentangler
+
+This part introduces the Zentangler interface on a small simulated `MultiAssayExperiment`. The goal is to see every stage of the workflow (data contract, A-path estimation, screening, B-stage fusion, inference, evidence combination, multiple-testing scope, bootstrap, and output inspection) before applying it to real data. To keep this part fast to read, the example chunks below are shown for reference and are not run during knitting. Copy any chunk into your console to execute it interactively.
+
+```{r part1-options, include = FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+## Overview
+
+Zentangler is an MAE-first R package for generic multiview parallel mediation
+analysis. The package is designed for studies where an exposure variable `X` may
+influence many candidate mediators distributed across multiple omics or assay
+views, and those mediators may in turn be associated with an outcome `Y`.
+
+The active method focuses on the parallel multiview mediation setting:
+
+```text
+X -> mediator in view 1 -> Y
+X -> mediator in view 2 -> Y
+...
+X -> mediator in view K -> Y
+```
+
+The package is intentionally generic. A view can be microbiome, metabolome,
+proteome, transcriptome, pathway abundance, clinical biomarkers, imaging-derived
+features, or any other numeric feature matrix. Zentangler does not assume exactly
+two views.
+
+The public user-facing input is a `MultiAssayExperiment` object. This is useful
+for Bioconductor package development because it keeps assay data, sample mapping,
+and phenotype variables in one coordinated container.
+
+## Statistical target
+
+For each mediator feature `j` in view `k`, Zentangler estimates two main pieces
+of evidence.
+
+The first piece is the A-path:
+
+```text
+Does X associate with mediator j in view k?
+```
+
+This gives an A-path coefficient `a_hat` and A-path p-value `p_a`.
+
+The second piece is the B-path:
+
+```text
+After accounting for X and other selected mediators, does mediator j associate
+with Y?
+```
+
+This gives a B-path coefficient `b` and B-path p-value `p_b`.
+
+The main mediation score is:
+
+```text
+score_j = a_hat_j * b_j
+```
+
+A positive score means the A-path and B-path have the same sign. A negative score
+means the A-path and B-path have opposite signs. Larger absolute scores are used
+as a ranking measure.
+
+Important scientific distinction: `score = a*b` remains the mediator-level
+screening and ranking score. Zentangler separately reports causal direct,
+indirect, and total effect summaries using an active-set parametric
+g-computation layer. These causal summaries are conditional on the selected
+mediator set and on the usual mediation identification assumptions; they are not
+a replacement for sensitivity analysis or a final selective-inference proof.
+
+## Input data contract
+
+The primary input is a `MultiAssayExperiment`.
+
+Zentangler expects:
+
+1. One or more experiments in `experiments(mae)`.
+2. Each experiment represents one view.
+3. Features are numeric.
+4. Samples can be aligned to `colData(mae)`.
+5. `colData(mae)` contains either a numeric exposure variable `x_var`, or the
+   case/time columns needed by `study_design`.
+6. `colData(mae)` contains the outcome variable `y_var`.
+7. Optional covariates are also stored in `colData(mae)`.
+
+Most Bioconductor assays are stored as features x samples. Zentangler extracts
+these into sample x feature matrices internally. Plain matrix-like experiments
+are also supported when sample IDs can be mapped.
+
+## Creating a small MAE
+
+The example below creates a small toy `MultiAssayExperiment`. In real analyses,
+you would replace these simulated matrices with your own assay data.
+
+```{r}
+library(Zentangler)
+library(MultiAssayExperiment)
+library(SummarizedExperiment)
+
+set.seed(1)
+
+n <- 80
+sample_ids <- paste0("sample_", seq_len(n))
+
+pheno <- DataFrame(
+  X = rbinom(n, 1, 0.5),
+  Y = rnorm(n),
+  group = sample(c("control", "case"), n, replace = TRUE),
+  visit = sample(c("T0", "T1"), n, replace = TRUE),
+  age = rnorm(n, mean = 50, sd = 10),
+  subject_id = sample(paste0("subject_", 1:40), n, replace = TRUE),
+  row.names = sample_ids
+)
+
+view1 <- matrix(rnorm(40 * n), nrow = 40, ncol = n)
+view2 <- matrix(rnorm(60 * n), nrow = 60, ncol = n)
+
+rownames(view1) <- paste0("view1_feature_", seq_len(nrow(view1)))
+rownames(view2) <- paste0("view2_feature_", seq_len(nrow(view2)))
+colnames(view1) <- sample_ids
+colnames(view2) <- sample_ids
+
+mae <- MultiAssayExperiment(
+  experiments = ExperimentList(
+    view1 = SummarizedExperiment(assays = list(abundance = view1)),
+    view2 = SummarizedExperiment(assays = list(abundance = view2))
+  ),
+  colData = pheno
+)
+```
+
+## Running the main model
+
+A minimal fit uses a method preset.
+
+```{r}
+fit <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_var = "Y",
+  method_preset = "fast_lasso",
+  sis_n = 25,
+  fdr_method = "BH",
+  fdr_scope = "global"
+)
+```
+
+The `method_preset` argument is meant to make the API safer and more stable. It
+lets users select a coherent method configuration without manually setting every
+low-level option.
+
+You can inspect available presets with:
+
+```{r}
+zentangler_method_presets()
+```
+
+## Study Design Helpers
+
+The default `study_design = "standard"` uses `x_var` directly. This remains the
+right interface when the exposure is already numeric.
+
+```{r}
+fit <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_var = "Y"
+)
+```
+
+For case-control data, Zentangler can create the 0/1 exposure internally:
+
+```{r}
+fit_case <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  y_var = "Y",
+  study_design = "case_control",
+  case_var = "group",
+  control_level = "control",
+  case_level = "case"
+)
+```
+
+For a time-only analysis, choose one reference and one comparison time point:
+
+```{r}
+fit_time <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  y_var = "Y",
+  study_design = "time",
+  time_var = "visit",
+  time_ref = "T0",
+  time_compare = "T1"
+)
+```
+
+For data with both case/control status and time points, use
+`study_design = "case_control_time"`. The `exposure_role` controls whether the
+exposure is the time contrast, the case-control contrast, or the case-by-time
+interaction. With `add_design_covariates = TRUE`, Zentangler adjusts for the
+remaining design terms.
+
+```{r}
+fit_case_time <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  y_var = "Y",
+  study_design = "case_control_time",
+  case_var = "group",
+  control_level = "control",
+  case_level = "case",
+  time_var = "visit",
+  time_ref = "T0",
+  time_compare = "T1",
+  exposure_role = "interaction"
+)
+```
+
+Current presets include:
+
+```text
+custom
+fast_lasso
+elastic_net
+longitudinal_maaslin2
+full_exploratory
+```
+
+`custom` keeps user-specified arguments. The other presets set common defaults
+for A-stage modeling, screening, fusion, penalty choice, and B-stage inference.
+
+## Stage 1: A-path estimation
+
+The A-stage asks whether each candidate mediator is associated with the exposure.
+This is done separately within each view.
+
+For mediator `j` in view `k`, the basic model is:
+
+```text
+M_jk = alpha_jk + a_jk * X + covariate terms + error_jk
+```
+
+The coefficient `a_jk` is the A-path estimate. The p-value testing whether
+`a_jk = 0` is stored as `p_a`.
+
+Zentangler currently provides two A-stage options.
+
+### HIMA-like linear A-stage
+
+```{r}
+fit <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_var = "Y",
+  a_stage_model = "lm",
+  sis_n = 25,
+  fusion_mode = "early"
+)
+```
+
+This option uses transparent univariate linear modeling. It is simple, fast, and
+close in spirit to the first screening step used in HIMA-style pipelines.
+
+### MaAsLin2 A-stage
+
+```{r}
+fit <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_var = "Y",
+  a_stage_model = "maaslin2",
+  maaslin2_random_effect = "subject_id",
+  maaslin2_normalization = "NONE",
+  maaslin2_transform = "NONE",
+  maaslin2_analysis_method = "LM",
+  sis_n = 25,
+  fusion_mode = "early"
+)
+```
+
+This option is useful when the A-stage needs MaAsLin2-style modeling, especially
+when repeated measures or subject-level random effects are important. In this
+mode, covariates and random effects are modeled directly by MaAsLin2 rather than
+through the internal residualization path.
+
+## Stage 2: Screening
+
+High-dimensional mediation can involve hundreds or thousands of mediators per
+view. Zentangler therefore supports screening before fitting the Y model.
+
+The default screening strategy is SIS-style filtering:
+
+```text
+Keep the top N mediators per view.
+```
+
+The ranking can be based on either the magnitude of the A-path estimate or the
+A-path p-value.
+
+```{r}
+fit <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_var = "Y",
+  screen_method = "sis",
+  sis_n = 50,
+  sis_rank = "abs_a"
+)
+```
+
+To turn this off and pass all filtered numeric mediators into the B-stage:
+
+```{r}
+fit <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_var = "Y",
+  screen_method = "none"
+)
+```
+
+Turning off screening can increase power when sample size is large enough, but it
+also makes the Y-stage larger and can be less stable in small sample settings.
+
+## Stage 3: Multiview B-stage fusion
+
+After A-stage estimation and optional screening, Zentangler fits a Y-stage model
+that includes `X`, selected mediators from the views, and optional covariates.
+
+The conceptual model is:
+
+```text
+Y = direct X term + selected mediator terms + covariate terms + error
+```
+
+The mediator coefficient from this stage is the B-path estimate `b`.
+
+Zentangler currently supports three fusion modes.
+
+### Survival outcomes
+
+For time-to-event outcomes, use Cox survival models by setting
+`y_family = "survival"` and providing follow-up time and event columns.
+
+```{r}
+fit_surv <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_family = "survival",
+  survival_time_var = "time",
+  survival_event_var = "status",
+  fusion_mode = "early",
+  b_inference = "refit"
+)
+```
+
+Survival outcomes currently support early and late fusion. The B-stage can use
+`b_inference = "refit"`, `b_inference = "bootstrap"`, or
+`b_inference = "debiased_cox_lasso"`. The Cox de-biased option currently uses a
+Cox active-set Wald approximation after sparse selection, so bootstrap is the
+recommended uncertainty route when resampling is affordable.
+
+### Early fusion
+
+```{r}
+fit <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_var = "Y",
+  fusion_mode = "early",
+  glmnet_alpha = 1,
+  lambda_choice = "lambda.1se"
+)
+```
+
+Early fusion concatenates all selected mediators from all views into one design
+matrix and fits one penalized model. This lets all views compete directly inside
+a single model. It is simple and often a good first option.
+
+`glmnet_alpha = 1` gives lasso. Values between 0 and 1 give elastic net. For
+example:
+
+```{r}
+fit <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_var = "Y",
+  fusion_mode = "early",
+  glmnet_alpha = 0.5
+)
+```
+
+### Intermediate fusion
+
+```{r}
+fit <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_var = "Y",
+  fusion_mode = "intermediate",
+  coop_rho = 0.2
+)
+```
+
+Intermediate fusion uses a cooperative learning style update. Instead of simply
+concatenating all mediators, it encourages agreement across view-specific fitted
+signals. This is useful when the goal is to borrow strength across views while
+still keeping view-specific mediator coefficients.
+
+At present, the intermediate mode uses a cooperative lasso-style Gaussian Y-stage
+implementation. The `glmnet_alpha` elastic-net setting is currently applied to
+early and late fusion, not to the intermediate cooperative update.
+
+### Late fusion
+
+```{r}
+fit <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_var = "Y",
+  fusion_mode = "late",
+  glmnet_alpha = 1
+)
+```
+
+Late fusion fits view-specific penalized models first and then combines the
+view-level fitted signals in a meta model. This can help preserve view-level
+structure and can be useful when views have very different feature scales or
+feature counts.
+
+## Stage 4: B-path inference
+
+The default B-stage inference is HIMA-style de-biased lasso inference:
+
+```{r}
+fit <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_var = "Y",
+  b_inference = "debiased_lasso"
+)
+```
+
+The purpose is to obtain approximate p-values for mediator B-path coefficients
+after sparse model fitting. The package also includes a refit option:
+
+```{r}
+fit <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_var = "Y",
+  b_inference = "refit"
+)
+```
+
+The refit option uses the selected active set and computes ordinary refit-based
+p-values. This is simpler to explain, but can be less stable if the selected
+active set is too large relative to sample size.
+
+Bootstrap refits can also be used for B-path inference:
+
+```{r}
+fit <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_var = "Y",
+  b_inference = "bootstrap",
+  bootstrap_repeats = 100
+)
+```
+
+With this option, `p_b` is replaced by the bootstrap B-path p-value before
+`p_primary` and the final q-values are recomputed. The table also retains
+`p_b_model_based`, `p_b_bootstrap`, and B-path bootstrap interval columns.
+
+## Stage 5: Combining mediator evidence
+
+For each mediator, Zentangler reports:
+
+```text
+a_hat      A-path estimate
+p_a        A-path p-value
+b          B-path estimate
+p_b        B-path p-value
+score      a_hat * b
+abs_score  abs(score)
+p_primary  primary mediator evidence p-value
+q_primary  selected final FDR-adjusted p_primary
+```
+
+The main ranking score is `score = a_hat * b`.
+
+The current p-value combination is conservative. In the default output,
+`p_primary` follows the joint A/B evidence field, which is currently based on the
+larger of the A-path and B-path p-values when both are available. This asks for
+both sides of the mediation pattern to show evidence.
+
+This is useful for screening and ranking. It should not be described as final
+post-selection-valid causal inference.
+
+## Multiple-testing scope
+
+Zentangler separates two choices that are easy to confuse:
+
+1. Which FDR correction method should be used?
+2. What family of hypotheses should the final q-values be adjusted over?
+
+The correction method is controlled by `fdr_method`:
+
+```{r}
+fit <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_var = "Y",
+  fdr_method = "BH"
+)
+```
+
+`fdr_method = "BH"` uses Benjamini-Hochberg. This is the usual default.
+`fdr_method = "BY"` uses Benjamini-Yekutieli, which is more conservative and can
+be useful when dependence across tests is a major concern.
+
+The final q-value family is controlled by `fdr_scope`:
+
+```{r}
+fit_global <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_var = "Y",
+  fdr_scope = "global"
+)
+
+fit_within <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_var = "Y",
+  fdr_scope = "within_view"
+)
+```
+
+`fdr_scope = "global"` adjusts the final primary p-values across all mediators
+from all assay views. This treats the full multiview mediator search as one
+multiple-testing family.
+
+`fdr_scope = "within_view"` adjusts the final primary p-values separately inside
+each assay view. This treats each view as its own multiple-testing family.
+
+The combined mediator table keeps both q-value columns regardless of which scope
+is selected:
+
+```text
+q_primary_global       final q-value adjusted across all views
+q_primary_within_view  final q-value adjusted separately within each view
+q_primary              q-value used by the current fit, based on fdr_scope
+```
+
+This makes it possible to compare global and within-view calls after fitting,
+without changing the A-stage or B-stage model.
+
+## Optional bootstrap uncertainty
+
+Zentangler can run bootstrap resampling to add uncertainty summaries for mediator
+scores, B-path coefficients, and effect summaries.
+
+```{r}
+fit <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_var = "Y",
+  fusion_mode = "early",
+  bootstrap_repeats = 100,
+  bootstrap_ci_level = 0.95,
+  seed = 1
+)
+```
+
+For repeated-measure or longitudinal data, use `bootstrap_id` to resample at the
+subject level rather than treating repeated observations as independent samples.
+
+```{r}
+fit <- fit_multiview_parallel_zentangler(
+  mae = mae,
+  x_var = "X",
+  y_var = "Y",
+  fusion_mode = "early",
+  bootstrap_repeats = 100,
+  bootstrap_id = "subject_id"
+)
+```
+
+Subject-level bootstrap is usually more appropriate when multiple samples come
+from the same subject.
+
+## Inspecting outputs
+
+The full mediator table is available as:
+
+```{r}
+all_mediators <- zentangler_all_mediators(fit)
+head(all_mediators)
+```
+
+The top-ranked mediators are available with:
+
+```{r}
+zentangler_top_mediators(fit, n = 20)
+```
+
+Active mediators can be extracted by BH q-value threshold:
+
+```{r}
+zentangler_active_mediators(fit, q_threshold = 0.25)
+```
+
+View-level summaries are available with:
+
+```{r}
+zentangler_view_summary(fit, q_threshold = 0.25)
+```
+
+A model-level summary is available with:
+
+```{r}
+zentangler_model_summary(fit, q_threshold = 0.25)
+```
+
+A compact summary bundle is available with:
+
+```{r}
+summary <- summarize_zentangler(fit, q_threshold = 0.25)
+names(summary)
+```
+
+The summary helper can also evaluate several q-value thresholds from the same
+fitted model:
+
+```{r}
+summary <- summarize_zentangler(
+  fit,
+  q_threshold = seq(0.05, 0.25, by = 0.05)
+)
+
+summary$threshold_summary
+```
+
+This does not refit the model. It only re-counts active mediators under each
+threshold and each available q-value column.
+
+The fit object also contains a `diagnostics` field:
+
+```{r}
+fit$diagnostics
+```
+
+This includes sample counts, view counts, feature counts before and after
+filtering, screened mediator counts, active B-path counts, runtime, R version,
+and bootstrap failures if any occurred.
+
+## Effect decomposition
+
+The fit object includes an `effect_decomposition` table:
+
+```{r}
+fit$effect_decomposition
+```
+
+This reports selected-active-set natural-direct-effect-style, natural-indirect-effect-style,
+and total-effect-style summaries. For binary exposures, the default contrast is
+the lower observed exposure level versus the higher observed exposure level. For
+continuous exposures, the default contrast is the 25th versus 75th percentile,
+unless `effect_x0` and `effect_x1` are supplied by the user.
+
+For Gaussian outcomes, effects are reported on the mean-difference scale. For
+binary outcomes, effects are reported on the risk-difference scale by averaging
+predicted probabilities under the relevant counterfactual mediator values.
+
+## Running simulations
+
+Zentangler includes simulation wrappers for InterSIM/SIMMBA-style MAE simulation
+studies.
+
+```{r}
+res <- run_intersim_zentangler(
+  nrep = 10,
+  nsample = 600,
+  fusion_modes = c("early", "intermediate", "late"),
+  screen_method = "sis",
+  sis_n = 200,
+  fdr_method = "BH",
+  fdr_scope = "both",
+  q_threshold = seq(0.05, 0.25, by = 0.05),
+  lambda_choice = "lambda.min",
+  glmnet_alpha = 1
+)
+
+res$summary
+```
+
+Binary simulations use `outcome.type = "binary"` and fit the Y-stage with
+`y_family = "binomial"`:
+
+```{r}
+sim_binary <- gen_simmba(
+  nsample = 100,
+  nrep = 1,
+  outcome.type = "binary",
+  ygen.mode = "LM",
+  seed = 1
+)
+
+binary_fit <- fit_multiview_parallel_zentangler(
+  sim_binary$trainMae[[1]],
+  x_var = "A",
+  y_var = "Y",
+  y_family = "binomial",
+  fusion_mode = "early",
+  b_inference = "debiased_logistic_lasso",
+  sis_n = 50,
+  screen_method = "sis",
+  seed = 1
+)
+
+head(zentangler_all_mediators(binary_fit))
+```
+
+Survival simulations use `outcome.type = "survival"` and store the outcome as
+`time` plus 0/1 `status`. For quick checks without bootstrap, use Cox refit or
+the Cox lasso B-stage approximation:
+
+```{r}
+sim_surv <- gen_simmba(
+  nsample = 100,
+  nrep = 1,
+  outcome.type = "survival",
+  ygen.mode = "LM",
+  seed = 1
+)
+
+surv_fit_refit <- fit_multiview_parallel_zentangler(
+  sim_surv$trainMae[[1]],
+  x_var = "A",
+  y_family = "survival",
+  survival_time_var = "time",
+  survival_event_var = "status",
+  fusion_mode = "early",
+  b_inference = "refit",
+  sis_n = 50,
+  screen_method = "sis",
+  seed = 1
+)
+
+surv_fit_cox <- fit_multiview_parallel_zentangler(
+  sim_surv$trainMae[[1]],
+  x_var = "A",
+  y_family = "survival",
+  survival_time_var = "time",
+  survival_event_var = "status",
+  fusion_mode = "early",
+  b_inference = "debiased_cox_lasso",
+  sis_n = 50,
+  screen_method = "sis",
+  seed = 1
+)
+
+head(zentangler_all_mediators(surv_fit_refit))
+head(zentangler_all_mediators(surv_fit_cox))
+```
+
+The simulation wrapper returns:
+
+```text
+summary    average performance across simulation replicates
+detail     replicate-level performance
+fits       fitted Zentangler objects
+truth      simulation truth tables
+errors     model failures, if any
+settings   simulation and model settings
+```
+
+When `q_threshold` is a vector, Zentangler fits each simulated dataset once and
+then evaluates active mediator recovery at each threshold. When
+`fdr_scope = "both"`, the simulation summary includes both global and within-view
+q-value families. This is useful for HPC runs because it avoids launching
+separate jobs that differ only by the active-mediator q cutoff.
+
+Common simulation metrics include:
+
+```text
+n_active          number of selected active mediators
+true_active       number of selected mediators that are truly active
+false_active      number of selected mediators that are false positives
+precision         true_active / n_active
+recall            true_active / total true mediators
+fdr               false_active / n_active
+top50_true        number of true mediators in the top 50 ranked mediators
+top50_precision   top50_true / 50
+```
+
+# Part 2: Applied Analysis on ASD Multi-omics Data
+
+Part 1 showed the mechanics on a toy object. We now run a complete, executed analysis on the autism spectrum disorder (ASD) multi-omics example files. This part is meant to be run end to end during the hands-on, so the chunks below are executed during knitting.
+
+The scientific setup is a treatment-time mediation question. The exposure `X` encodes baseline (`T0`) versus a follow-up time point (`T1` or `T2`), the outcome `Y` is a symptom score, and the candidate mediators are features drawn from four molecular views: gut species, KEGG orthologs (KOs), fecal metabolites, and plasma metabolites. We fit Zentangler jointly across all four views, then run HIMA2 one view at a time as a single-view comparator, and finally use simulated data with known mediators to check recovery, precision, and false discovery behavior.
+
+The applied analysis expects the ASD `.RData` files to be available in the repository `data/` directory (the `find_data_dir()` helper below resolves `data/` and `../data/`, so knitting from `notebooks/` finds the repository-level `data/` folder), or in the folder named by the `ZENTANGLER_DATA_DIR` environment variable. Confirm that these files are present before running this part.
+
+```{r part2-options, include = FALSE}
+knitr::opts_chunk$set(eval = TRUE)
+```
+
+## Overview
+
+This tutorial shows how to run two mediation workflows on the ASD multi-omics
+example files in `data/`:
+
+1. **HIMA2** as a single-view comparator, run independently for each modality.
+2. **Zentangler** as a multiview mediation model over all available modalities.
+
+The example files are:
+
+```text
+data/ASD_Species.RData
+data/ASD_KOs.RData
+data/ASD_fecalMetabolites.RData
+data/ASD_plasmaMetabolites.RData
+data/ASD_Symptoms.RData
+```
+
+## Packages
+
+```{r}
+library(Zentangler)
+library(MultiAssayExperiment)
+library(SummarizedExperiment)
+library(S4Vectors)
+
+# HIMA is needed only for the single-view HIMA2 comparator.
+if (!requireNamespace("HIMA", quietly = TRUE)) {
+  stop("Install HIMA before running the HIMA2 part of this tutorial.")
+}
+if (!exists("hima2", envir = asNamespace("HIMA"), inherits = FALSE)) {
+  stop("The installed HIMA package does not expose HIMA::hima2().")
+}
+```
+
+## Load The ASD Data
+
+The omics `.RData` files each contain a `pcl` list with `features`, `metadata`,
+and `features_metadata`. The symptom file contains a long table with columns
+`ID`, `Symptom`, `Timepoint`, and `Score`.
+
+```{r}
+find_data_dir <- function() {
+  env_dir <- Sys.getenv("ZENTANGLER_DATA_DIR", unset = "")
+  candidates <- c(
+    env_dir,
+    "data",
+    file.path("..", "data"),
+    file.path(getwd(), "data"),
+    file.path(dirname(getwd()), "data")
+  )
+  candidates <- candidates[nzchar(candidates)]
+  hits <- candidates[dir.exists(candidates)]
+  if (length(hits) == 0) {
+    stop(
+      "Could not find the ASD data directory. Set ZENTANGLER_DATA_DIR to ",
+      "the folder containing ASD_Species.RData, ASD_KOs.RData, ",
+      "ASD_fecalMetabolites.RData, ASD_plasmaMetabolites.RData, and ",
+      "ASD_Symptoms.RData."
+    )
+  }
+  normalizePath(hits[[1]], mustWork = TRUE)
+}
+
+data_dir <- find_data_dir()
+data_dir
+
+read_pcl <- function(path) {
+  e <- new.env(parent = emptyenv())
+  load(path, envir = e)
+  if (!exists("pcl", envir = e, inherits = FALSE)) {
+    stop("Expected object `pcl` in ", path)
+  }
+  get("pcl", envir = e)
+}
+
+omics_files <- c(
+  species = "ASD_Species.RData",
+  kos = "ASD_KOs.RData",
+  fecal_metabolites = "ASD_fecalMetabolites.RData",
+  plasma_metabolites = "ASD_plasmaMetabolites.RData"
+)
+
+omics <- lapply(file.path(data_dir, omics_files), read_pcl)
+names(omics) <- names(omics_files)
+symptoms <- read_pcl(file.path(data_dir, "ASD_Symptoms.RData"))$features
+```
+
+## Build A MultiAssayExperiment
+
+For the ASD tutorial, the exposure is treatment time:
+
+```text
+X = 0 at baseline T0
+X = 1 at follow-up T1 or T2
+```
+
+The outcome is one symptom score. The helper below builds a
+`MultiAssayExperiment` for one contrast and one symptom. The returned MAE uses
+subject-time IDs as primary sample IDs so the modalities and phenotype table are
+aligned.
+
+```{r}
+normalize_omics_time <- function(x) {
+  z <- toupper(trimws(as.character(x)))
+  out <- rep(NA_character_, length(z))
+  out[z %in% c("1", "0", "T0", "BASELINE")] <- "T0"
+  out[z %in% c("3", "10", "T1", "10WK", "WEEK10", "MTT_10WK")] <- "T1"
+  out[z %in% c("2YR", "2YR_FOLLOWUP", "T2", "YEAR2", "2Y")] <- "T2"
+  out
+}
+
+normalize_symptom_time <- function(x) {
+  z <- toupper(trimws(as.character(x)))
+  out <- rep(NA_character_, length(z))
+  out[z %in% c("T0", "BASELINE", "0")] <- "T0"
+  out[z %in% c("T1", "10", "10WK", "WEEK10", "1")] <- "T1"
+  out[z %in% c("T2", "2YR", "2YR_FOLLOWUP", "2")] <- "T2"
+  out
+}
+
+make_primary_id <- function(subject_id, timepoint) {
+  paste(as.character(subject_id), as.character(timepoint), sep = "__")
+}
+
+numeric_feature_matrix <- function(x, fill_zero = TRUE, scale_features = TRUE) {
+  x <- as.data.frame(x, check.names = FALSE, stringsAsFactors = FALSE)
+  mat <- as.matrix(data.frame(lapply(x, function(z) {
+    suppressWarnings(as.numeric(as.character(z)))
+  }), check.names = FALSE))
+  colnames(mat) <- colnames(x)
+  rownames(mat) <- rownames(x)
+  storage.mode(mat) <- "numeric"
+  if (fill_zero) mat[!is.finite(mat)] <- 0
+  keep <- apply(mat, 2, function(z) stats::var(z, na.rm = TRUE) > 0)
+  mat <- mat[, keep, drop = FALSE]
+  if (scale_features && ncol(mat) > 0) {
+    mat <- scale(mat)
+    mat[!is.finite(mat)] <- 0
+  }
+  mat
+}
+
+build_asd_mae <- function(
+  omics,
+  symptoms,
+  contrast = c("T1", "T2"),
+  symptom = "abc",
+  views = names(omics),
+  fill_zero = TRUE,
+  scale_features = TRUE
+) {
+  contrast <- match.arg(contrast)
+  keep_times <- c("T0", contrast)
+
+  sym <- as.data.frame(symptoms, check.names = FALSE, stringsAsFactors = FALSE)
+  sym$time_norm <- normalize_symptom_time(sym$Timepoint)
+  sym <- sym[sym$Symptom == symptom & sym$time_norm %in% keep_times, , drop = FALSE]
+  sym$primary <- make_primary_id(sym$ID, sym$time_norm)
+  sym$X <- as.integer(sym$time_norm == contrast)
+  sym$Y <- suppressWarnings(as.numeric(as.character(sym$Score)))
+  sym <- sym[is.finite(sym$Y), c("primary", "ID", "time_norm", "X", "Y"), drop = FALSE]
+  rownames(sym) <- sym$primary
+
+  experiments <- list()
+  sample_map_rows <- list()
+
+  for (view in views) {
+    pcl <- omics[[view]]
+    meta <- as.data.frame(pcl$metadata, check.names = FALSE, stringsAsFactors = FALSE)
+    feat <- as.data.frame(pcl$features, check.names = FALSE, stringsAsFactors = FALSE)
+
+    meta$time_norm <- normalize_omics_time(meta$Time_point)
+    meta$primary <- make_primary_id(meta[["Subject ID"]], meta$time_norm)
+    rownames(feat) <- meta$primary
+
+    idx <- meta$time_norm %in% keep_times & meta$primary %in% sym$primary
+    if (!any(idx)) next
+
+    mat <- numeric_feature_matrix(
+      feat[idx, , drop = FALSE],
+      fill_zero = fill_zero,
+      scale_features = scale_features
+    )
+    if (nrow(mat) < 4 || ncol(mat) < 2) next
+
+    # SummarizedExperiment stores assays as features x samples.
+    experiments[[view]] <- SummarizedExperiment::SummarizedExperiment(
+      assays = list(abundance = t(mat))
+    )
+    sample_map_rows[[view]] <- data.frame(
+      assay = view,
+      primary = rownames(mat),
+      colname = rownames(mat),
+      stringsAsFactors = FALSE
+    )
+  }
+
+  if (length(experiments) == 0) {
+    stop("No usable omics views were available for contrast=", contrast,
+         " and symptom=", symptom)
+  }
+
+  primary_ids <- Reduce(union, lapply(sample_map_rows, `[[`, "primary"))
+  pheno <- sym[intersect(rownames(sym), primary_ids), , drop = FALSE]
+  sample_map <- do.call(rbind, sample_map_rows)
+  sample_map <- sample_map[sample_map$primary %in% rownames(pheno), , drop = FALSE]
+  sample_map <- S4Vectors::DataFrame(
+    assay = sample_map$assay,
+    primary = sample_map$primary,
+    colname = sample_map$colname
+  )
+
+  MultiAssayExperiment::MultiAssayExperiment(
+    experiments = experiments,
+    colData = S4Vectors::DataFrame(
+      X = pheno$X,
+      Y = pheno$Y,
+      subject_id = pheno$ID,
+      timepoint = pheno$time_norm,
+      row.names = rownames(pheno)
+    ),
+    sampleMap = sample_map
+  )
+}
+
+mae_t1_abc <- build_asd_mae(
+  omics = omics,
+  symptoms = symptoms,
+  contrast = "T1",
+  symptom = "ABC"
+)
+mae_t1_abc
+```
+
+## Run Zentangler
+
+Zentangler fits all selected views in one multiview model. For quick iteration,
+start with the fast lasso preset and a modest SIS screen. Increase `sis_n`, use
+`method_preset = "full_exploratory"`, or add bootstrap repeats for a larger
+analysis.
+
+The ASD example is a time-point contrast, so the call below uses
+`study_design = "time"` instead of passing `x_var = "X"` directly. Zentangler
+encodes `timepoint == "T0"` as 0 and `timepoint == "T1"` as 1 internally. The
+explicit `X` column is still kept in the MAE because the HIMA2 comparator helper
+below uses it directly.
+
+```{r}
+zt_fit <- fit_multiview_parallel_zentangler(
+  mae_t1_abc,
+  y_var = "Y",
+  study_design = "time",
+  time_var = "timepoint",
+  time_ref = "T0",
+  time_compare = "T1",
+  covariates = NULL,
+  glmnet_alpha = 0.5,
+  sis_n = 50,
+  sis_rank = "abs_a",
+  screen_method = "sis",
+  fusion_mode = "late",
+  y_family = "gaussian",
+  fdr_method = "BH",
+  fdr_scope = "global",
+  fill_nonfinite_zero = TRUE,
+  seed = 1
+)
+
+zentangler_model_summary(zt_fit)
+zentangler_view_summary(zt_fit, q_threshold = 0.25)
+zentangler_top_mediators(zt_fit, n = 20)
+zentangler_active_mediators(zt_fit, q_threshold = 0.25)
+```
+
+Save the main outputs:
+
+```{r}
+out_dir <- file.path("tutorial_results", "zentangler_t1_abc")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+write.csv(zentangler_all_mediators(zt_fit),
+          file.path(out_dir, "zentangler_all_mediators.csv"),
+          row.names = FALSE)
+write.csv(zentangler_active_mediators(zt_fit, q_threshold = 0.25),
+          file.path(out_dir, "zentangler_active_mediators_q0p25.csv"),
+          row.names = FALSE)
+write.csv(zentangler_view_summary(zt_fit, q_threshold = 0.25),
+          file.path(out_dir, "zentangler_view_summary_q0p25.csv"),
+          row.names = FALSE)
+saveRDS(zt_fit, file.path(out_dir, "zentangler_fit.rds"))
+```
+
+## Run HIMA2 One View At A Time
+
+HIMA2 is a single-view method, so the comparator loops over the experiments in
+the MAE and runs one model per modality. The helper below adapts to the two main
+HIMA2 calling styles seen across HIMA versions.
+
+```{r}
+mae_block <- function(mae, view) {
+  extract_block <- getFromNamespace("zentangler_mae_extract_block", "Zentangler")
+  extract_block(
+    mae,
+    experiment_name = view,
+    fill_nonfinite_zero = TRUE
+  )
+}
+
+run_hima2_one_view <- function(M, pheno, penalty = "DBlasso", outcome_family = "gaussian") {
+  fun <- get("hima2", envir = asNamespace("HIMA"))
+  argn <- names(formals(fun))
+  data_M <- as.data.frame(M, check.names = FALSE)
+
+  if ("formula" %in% argn) {
+    call_args <- list(formula = Y ~ X)
+    if ("data.pheno" %in% argn) call_args$data.pheno <- pheno
+    if ("data.M" %in% argn) call_args$data.M <- data_M
+    if ("mediator.type" %in% argn) call_args$mediator.type <- "gaussian"
+    if ("mediator.family" %in% argn) call_args$mediator.family <- "gaussian"
+    if ("outcome.family" %in% argn) call_args$outcome.family <- outcome_family
+    if ("penalty" %in% argn) call_args$penalty <- penalty
+    if ("scale" %in% argn) call_args$scale <- FALSE
+    if ("verbose" %in% argn) call_args$verbose <- FALSE
+    if ("topN" %in% argn) call_args$topN <- ncol(data_M)
+    if ("sigcut" %in% argn) call_args$sigcut <- 1
+    if ("Sigcut" %in% argn) call_args$Sigcut <- 1
+    return(do.call(fun, call_args))
+  }
+
+  call_args <- list(X = pheno$X, Y = pheno$Y, M = as.matrix(M))
+  if ("penalty" %in% argn) call_args$penalty <- penalty
+  if ("topN" %in% argn) call_args$topN <- ncol(M)
+  if ("sigcut" %in% argn) call_args$sigcut <- 1
+  if ("Sigcut" %in% argn) call_args$Sigcut <- 1
+  do.call(fun, call_args)
+}
+
+standardize_hima2_table <- function(fit, view, rep = NA_integer_) {
+  tab <- tryCatch({
+    if (inherits(fit, "hima") && is.list(fit)) {
+      lens <- vapply(fit, length, integer(1))
+      keep <- names(fit)[lens == max(lens) & lens > 0]
+      as.data.frame(fit[keep], check.names = FALSE, stringsAsFactors = FALSE)
+    } else {
+      as.data.frame(fit, check.names = FALSE)
+    }
+  }, error = function(e) data.frame())
+  if (nrow(tab) == 0) return(tab)
+
+  if ("ID" %in% names(tab)) {
+    tab$mediator <- as.character(tab$ID)
+  } else {
+    tab$mediator <- rownames(tab)
+  }
+  rownames(tab) <- NULL
+  names(tab) <- make.names(names(tab), unique = TRUE)
+
+  p_col <- intersect(c("p.value", "p.value.", "p", "P.value", "raw.p", "raw_p"), names(tab))
+  q_col <- intersect(c("BH.FDR", "BH_FDR", "q.value", "qvalue", "FDR"), names(tab))
+  a_col <- intersect(c("alpha", "a", "alpha_hat"), names(tab))
+  b_col <- intersect(c("beta", "b", "beta_hat"), names(tab))
+  ab_col <- intersect(c("alpha.beta", "alpha.beta.", "alpha.beta.."), names(tab))
+
+  tab$p_primary <- if (length(p_col) > 0) as.numeric(tab[[p_col[[1]]]]) else NA_real_
+  tab$q_hima_reported <- if (length(q_col) > 0) as.numeric(tab[[q_col[[1]]]]) else NA_real_
+  tab$a <- if (length(a_col) > 0) as.numeric(tab[[a_col[[1]]]]) else NA_real_
+  tab$b <- if (length(b_col) > 0) as.numeric(tab[[b_col[[1]]]]) else NA_real_
+  tab$score <- if (length(ab_col) > 0) as.numeric(tab[[ab_col[[1]]]]) else tab$a * tab$b
+  tab$abs_score <- abs(tab$score)
+  tab$rep <- rep
+  tab$method <- "hima2"
+  tab$view <- view
+  tab$omics <- view
+  tab
+}
+
+run_hima2_mae <- function(mae,
+                          x_var = "X",
+                          y_var = "Y",
+                          rep = NA_integer_,
+                          penalty = "DBlasso",
+                          outcome_family = "gaussian") {
+  pheno <- as.data.frame(SummarizedExperiment::colData(mae))
+  if (!(x_var %in% colnames(pheno))) stop("x_var not found in MAE colData: ", x_var)
+  if (!(y_var %in% colnames(pheno))) stop("y_var not found in MAE colData: ", y_var)
+  pheno$X <- suppressWarnings(as.numeric(as.character(pheno[[x_var]])))
+  pheno$Y <- suppressWarnings(as.numeric(as.character(pheno[[y_var]])))
+  pheno <- pheno[is.finite(pheno$X) & is.finite(pheno$Y), , drop = FALSE]
+
+  results <- list()
+  for (view in names(MultiAssayExperiment::experiments(mae))) {
+    M <- mae_block(mae, view)
+    common <- intersect(rownames(pheno), rownames(M))
+    M <- M[common, , drop = FALSE]
+    pheno_view <- pheno[common, , drop = FALSE]
+    if (length(unique(pheno_view$X)) < 2 || nrow(pheno_view) < 8 || ncol(M) < 2) {
+      next
+    }
+
+    fit <- run_hima2_one_view(M, pheno_view, penalty = penalty, outcome_family = outcome_family)
+    results[[view]] <- standardize_hima2_table(fit, view, rep = rep)
+  }
+
+  out <- if (length(results) > 0) do.call(rbind, results) else data.frame()
+  if (nrow(out) > 0 && "p_primary" %in% names(out)) {
+    out$p_primary <- as.numeric(unlist(out$p_primary, use.names = FALSE))
+    out$q_primary_global <- p.adjust(out$p_primary, method = "BH")
+    out$q_primary <- out$q_primary_global
+    out$q_primary_within_view <- ave(
+      out$p_primary,
+      out$view,
+      FUN = function(p) p.adjust(p, method = "BH")
+    )
+  }
+  rownames(out) <- NULL
+  out
+}
+
+hima2_tab <- run_hima2_mae(mae_t1_abc)
+hima2_sig <- hima2_tab[
+  is.finite(as.numeric(hima2_tab$q_primary_global)) &
+    as.numeric(hima2_tab$q_primary_global) < 0.25,
+  ,
+  drop = FALSE
+]
+
+hima2_sig <- hima2_sig[
+  order(as.numeric(hima2_sig$q_primary_global)),
+  ,
+  drop = FALSE
+]
+
+head(hima2_sig, 20)
+```
+
+Save HIMA2 outputs:
+
+```{r}
+out_dir <- file.path("tutorial_results", "hima2_t1_abc")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+write.csv(hima2_tab,
+          file.path(out_dir, "hima2_all_mediators.csv"),
+          row.names = FALSE)
+write.csv(subset(hima2_tab, q_primary_global <= 0.25),
+          file.path(out_dir, "hima2_active_mediators_q0p25.csv"),
+          row.names = FALSE)
+```
+
+## Run Multiple Symptoms And Contrasts
+
+The same helper can run over symptoms and treatment contrasts. Fecal and plasma
+metabolite views have baseline and T1 samples. Species and KOs also include T2
+samples in these example objects.
+
+```{r}
+symptom_names <- sort(unique(symptoms$Symptom))
+contrasts <- c("T1", "T2")
+
+all_zentangler <- list()
+all_hima2 <- list()
+all_errors <- character(0)
+
+for (contrast in contrasts) {
+  for (symptom in symptom_names) {
+    key <- paste(contrast, symptom, sep = "__")
+
+    mae <- tryCatch(
+      build_asd_mae(omics, symptoms, contrast = contrast, symptom = symptom),
+      error = function(e) {
+        all_errors <<- c(all_errors, paste0(key, ": MAE build failed: ", conditionMessage(e)))
+        NULL
+      }
+    )
+    if (is.null(mae)) next
+
+    pheno <- as.data.frame(SummarizedExperiment::colData(mae))
+    if (length(unique(pheno$X[is.finite(pheno$X)])) < 2) {
+      all_errors <- c(all_errors, paste0(key, ": skipped because X has fewer than two levels."))
+      next
+    }
+
+    zt <- tryCatch(
+      fit_multiview_parallel_zentangler(
+        mae,
+        y_var = "Y",
+        study_design = "time",
+        time_var = "timepoint",
+        time_ref = "T0",
+        time_compare = contrast,
+        covariates = NULL,
+        glmnet_alpha = 0.5,
+        sis_n = 50,
+        sis_rank = "abs_a",
+        screen_method = "sis",
+        fusion_mode = "late",
+        y_family = "gaussian",
+        fdr_method = "BH",
+        fdr_scope = "global",
+        effect_x0 = 0,
+        effect_x1 = 1,
+        fill_nonfinite_zero = TRUE,
+        seed = 1
+      ),
+      error = function(e) {
+        all_errors <<- c(all_errors, paste0(key, ": Zentangler failed: ", conditionMessage(e)))
+        NULL
+      }
+    )
+
+    if (!is.null(zt)) {
+      zt_tab <- zentangler_all_mediators(zt)
+      zt_tab$contrast <- contrast
+      zt_tab$symptom <- symptom
+      all_zentangler[[key]] <- zt_tab
+    }
+
+    h2_tab <- tryCatch(run_hima2_mae(mae), error = function(e) data.frame())
+    if (nrow(h2_tab) > 0) {
+      h2_tab$contrast <- contrast
+      h2_tab$symptom <- symptom
+      all_hima2[[key]] <- h2_tab
+    }
+  }
+}
+
+zentangler_all <- if (length(all_zentangler)) do.call(rbind, all_zentangler) else data.frame()
+hima2_all <- if (length(all_hima2)) do.call(rbind, all_hima2) else data.frame()
+
+all_errors
+```
+
+## Zentangler Simulations
+
+Zentangler also includes SIMMBA/InterSIM-style simulation helpers. This is useful
+for checking that a method recovers known mediators before running the real ASD
+analysis.
+
+Because the simulated data carry a known truth, this section is the clearest place to build intuition about behavior. As you read the output below, focus on three things: recall (the fraction of true mediators recovered at the chosen q threshold), precision and observed FDR (whether the calls are trustworthy), and top-50 precision (whether the ranking puts true mediators near the top even before thresholding). The boxplots compare Zentangler against the single-view HIMA2 comparator across replicates, and the line plot tracks how many mediators each method calls active per replicate. A method that recovers more true signal while holding observed FDR near the nominal level is the goal.
+
+```{r, fig.width=8, fig.align='center', fig.height=6}
+set.seed(1)
+
+sim <- gen_simmba(
+  nsample = 500,
+  nrep =5,
+  snr = 1,
+  n.pathways = 30,
+  TIE = rep(1, 3),
+  outcome.type = "continuous",
+  ygen.mode = "LM",
+  seed = 1
+)
+
+zentangler_sim_recovery <- list()
+hima2_sim_recovery <- list()
+zentangler_sim_summaries <- list()
+hima2_sim_results <- list()
+
+for (rep_i in seq_along(sim$trainMae)) {
+  sim_mae <- sim$trainMae[[rep_i]]
+  truth <- sim$truthDat[[rep_i]]
+  truth_key <- zentangler_truth_key(truth)
+
+  sim_fit <- fit_multiview_parallel_zentangler(
+    sim_mae,
+    x_var = "A",
+    y_var = "Y",
+    covariates = NULL,
+    glmnet_alpha = 0.5,
+    sis_n = 50,
+    sis_rank = "abs_a",
+    screen_method = "sis",
+    fusion_mode = "late",
+    y_family = "gaussian",
+    fdr_method = "BH",
+    fdr_scope = "global",
+    effect_x0 = 0,
+    effect_x1 = 1,
+    fill_nonfinite_zero = TRUE,
+    seed = rep_i
+  )
+
+  zentangler_tab <- zentangler_all_mediators(sim_fit)
+  zentangler_sim_summaries[[rep_i]] <- summarize_zentangler(
+    sim_fit,
+    q_threshold = seq(0.05, 0.25, by = 0.05)
+  )
+  zentangler_sim_recovery[[rep_i]] <- zentangler_score_truth_recovery(
+    zentangler_tab,
+    truth_key = truth_key,
+    rep = rep_i,
+    fusion_mode = "late",
+    q_threshold = 0.25,
+    q_col = "q_primary",
+    fdr_scope = "global",
+    top_n = 50
+  )
+
+  hima2_tab <- run_hima2_mae(
+    sim_mae,
+    x_var = "A",
+    y_var = "Y",
+    rep = rep_i
+  )
+  hima2_sim_results[[rep_i]] <- hima2_tab
+  hima2_sim_recovery[[rep_i]] <- zentangler_score_truth_recovery(
+    hima2_tab,
+    truth_key = truth_key,
+    rep = rep_i,
+    fusion_mode = "singleview_hima2",
+    q_threshold = 0.25,
+    q_col = "q_primary",
+    fdr_scope = "global",
+    top_n = 50
+  )
+}
+
+zentangler_recovery <- do.call(rbind, zentangler_sim_recovery)
+hima2_recovery <- do.call(rbind, hima2_sim_recovery)
+
+zentangler_recovery
+hima2_recovery
+
+sim_recovery_plot <- rbind(
+  transform(zentangler_recovery, method = "Zentangler"),
+  transform(hima2_recovery, method = "HIMA2")
+)
+
+plot_metric_by_method <- function(df, metric, ylab = metric) {
+  boxplot(
+    stats::as.formula(paste(metric, "~ method")),
+    data = df,
+    ylab = ylab,
+    xlab = "",
+    col = c("#4C78A8", "#F58518"),
+    border = "#333333"
+  )
+  stripchart(
+    stats::as.formula(paste(metric, "~ method")),
+    data = df,
+    vertical = TRUE,
+    method = "jitter",
+    pch = 16,
+    col = "#00000066",
+    add = TRUE
+  )
+}
+
+op <- par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+plot_metric_by_method(sim_recovery_plot, "recall", "Recall at q <= 0.25")
+plot_metric_by_method(sim_recovery_plot, "precision", "Precision at q <= 0.25")
+plot_metric_by_method(sim_recovery_plot, "fdr", "Observed FDR at q <= 0.25")
+plot_metric_by_method(sim_recovery_plot, "top50_precision", "Top-50 precision")
+par(op)
+
+plot(
+  zentangler_recovery$rep,
+  zentangler_recovery$n_active,
+  type = "b",
+  pch = 16,
+  col = "#4C78A8",
+  ylim = range(c(zentangler_recovery$n_active, hima2_recovery$n_active), na.rm = TRUE),
+  xlab = "Simulation replicate",
+  ylab = "Active mediators at q <= 0.25"
+)
+lines(hima2_recovery$rep, hima2_recovery$n_active, type = "b", pch = 16, col = "#F58518")
+legend(
+  "topright",
+  legend = c("Zentangler", "HIMA2"),
+  col = c("#4C78A8", "#F58518"),
+  pch = 16,
+  lty = 1,
+  bty = "n"
+)
+
+```
+
+### Binary Simulation Check
+
+For binary outcomes, SIMMBA stores the generated outcome in `Y`. Zentangler uses
+`y_family = "binomial"`, and HIMA2 is run with `outcome_family = "binomial"`
+when the installed HIMA API exposes that argument.
+
+```{r}
+set.seed(1)
+
+sim_binary <- gen_simmba(
+  nsample = 100,
+  nrep = 1,
+  snr = 1,
+  n.pathways = 10,
+  TIE = rep(1, 3),
+  outcome.type = "binary",
+  ygen.mode = "LM",
+  seed = 1
+)
+
+binary_mae <- sim_binary$trainMae[[1]]
+binary_truth <- sim_binary$truthDat[[1]]
+binary_truth_key <- zentangler_truth_key(binary_truth)
+
+binary_fit <- fit_multiview_parallel_zentangler(
+  binary_mae,
+  x_var = "A",
+  y_var = "Y",
+  y_family = "binomial",
+  fusion_mode = "early",
+  b_inference = "debiased_logistic_lasso",
+  sis_n = 50,
+  screen_method = "sis",
+  fdr_method = "BH",
+  fdr_scope = "global",
+  fill_nonfinite_zero = TRUE,
+  seed = 1
+)
+
+binary_zentangler_tab <- zentangler_all_mediators(binary_fit)
+binary_zentangler_recovery <- zentangler_score_truth_recovery(
+  binary_zentangler_tab,
+  truth_key = binary_truth_key,
+  rep = 1,
+  fusion_mode = "early_binary",
+  q_threshold = 0.25,
+  q_col = "q_primary",
+  fdr_scope = "global",
+  top_n = 50
+)
+
+binary_hima2_tab <- tryCatch(
+  run_hima2_mae(
+    binary_mae,
+    x_var = "A",
+    y_var = "Y",
+    rep = 1,
+    outcome_family = "binomial"
+  ),
+  error = function(e) data.frame()
+)
+
+binary_hima2_recovery <- if (nrow(binary_hima2_tab) > 0) {
+  zentangler_score_truth_recovery(
+    binary_hima2_tab,
+    truth_key = binary_truth_key,
+    rep = 1,
+    fusion_mode = "singleview_hima2_binary",
+    q_threshold = 0.25,
+    q_col = "q_primary",
+    fdr_scope = "global",
+    top_n = 50
+  )
+} else {
+  data.frame()
+}
+
+binary_zentangler_recovery
+binary_hima2_recovery
+```
+
+### Survival Simulation Check
+
+For survival outcomes, SIMMBA stores the outcome as `time` and `status`.
+Zentangler supports Cox survival Y-stage models. This quick check avoids
+bootstrap and compares the two non-bootstrap survival B-stage options.
+
+```{r}
+set.seed(1)
+
+sim_surv <- gen_simmba(
+  nsample = 100,
+  nrep = 1,
+  snr = 1,
+  n.pathways = 10,
+  TIE = rep(1, 3),
+  outcome.type = "survival",
+  ygen.mode = "LM",
+  seed = 1
+)
+
+surv_mae <- sim_surv$trainMae[[1]]
+surv_truth <- sim_surv$truthDat[[1]]
+surv_truth_key <- zentangler_truth_key(surv_truth)
+
+surv_fit_refit <- fit_multiview_parallel_zentangler(
+  surv_mae,
+  x_var = "A",
+  y_family = "survival",
+  survival_time_var = "time",
+  survival_event_var = "status",
+  fusion_mode = "early",
+  b_inference = "refit",
+  sis_n = 10,
+  screen_method = "sis",
+  fdr_method = "BH",
+  fdr_scope = "global",
+  fill_nonfinite_zero = TRUE,
+  seed = 1
+)
+
+surv_fit_cox <- fit_multiview_parallel_zentangler(
+  surv_mae,
+  x_var = "A",
+  y_family = "survival",
+  survival_time_var = "time",
+  survival_event_var = "status",
+  fusion_mode = "early",
+  b_inference = "debiased_cox_lasso",
+  sis_n = 10,
+  screen_method = "sis",
+  fdr_method = "BH",
+  fdr_scope = "global",
+  fill_nonfinite_zero = TRUE,
+  seed = 1
+)
+
+surv_refit_recovery <- zentangler_score_truth_recovery(
+  zentangler_all_mediators(surv_fit_refit),
+  truth_key = surv_truth_key,
+  rep = 1,
+  fusion_mode = "early_survival_refit",
+  q_threshold = 0.25,
+  q_col = "q_primary",
+  fdr_scope = "global",
+  top_n = 50
+)
+
+surv_cox_recovery <- zentangler_score_truth_recovery(
+  zentangler_all_mediators(surv_fit_cox),
+  truth_key = surv_truth_key,
+  rep = 1,
+  fusion_mode = "early_survival_debiased_cox_lasso",
+  q_threshold = 0.25,
+  q_col = "q_primary",
+  fdr_scope = "global",
+  top_n = 50
+)
+
+surv_cox_recovery
+surv_refit_recovery
+```
+
+# Looking Ahead
+
+Across the three modules we moved from prediction (vertical integration), to reproducibility (horizontal integration), to mechanism (multiview mediation). Zentangler ties these threads together by asking not only whether an exposure relates to an outcome, but which features across which views carry that signal, and by reporting that evidence with explicit screening, fusion, inference, and multiple-testing choices.
+
+A few points are worth carrying forward. The `score = a * b` quantity is a screening and ranking measure, and the active-set causal summaries are conditional on the selected mediator set and the usual mediation identification assumptions. They are a principled starting point, not a substitute for sensitivity analysis or a final selective-inference proof. The fusion mode (early, intermediate, or late) and the FDR scope (global or within-view) are modeling choices that should be reported alongside results, since both can change which mediators are called active. Finally, the simulation harness is the most reliable way to build intuition for a new method, because it lets you compare recovery against known truth before committing to conclusions on real data.
+
+Zentangler continues to grow, with ongoing work on richer outcome families, additional fusion strategies, and tighter integration with the vertical and horizontal frameworks introduced earlier in the day. Used together, the three toolkits form a coherent statistical language for multimodal data integration that balances prediction, reproducibility, and mechanistic interpretation.
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
