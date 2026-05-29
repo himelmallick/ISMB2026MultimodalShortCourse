@@ -8,19 +8,6 @@ This repository contains the notebooks, slides, datasets, and setup instructions
 
 This short course introduces methods for working with and integrating multiple data modalities in computational biology (for example single-cell multiomics, spatial transcriptomics, imaging, and proteomics) using the Bioconductor ecosystem. Each module pairs a short conceptual introduction with a hands-on R Markdown notebook.
 
-> Note: the module list below is a starting scaffold. Edit the titles and topics to match your final syllabus.
-
-## Modules
-
-| # | Module | Notebook |
-|---|--------|----------|
-| 00 | Introduction and setup | `notebooks/00_introduction.Rmd` |
-| 01 | Working with multimodal data | `notebooks/01_data_basics.Rmd` |
-| 02 | Single-cell multiomics | `notebooks/02_single_cell_multiomics.Rmd` |
-| 03 | Spatial and imaging data | `notebooks/03_spatial_imaging.Rmd` |
-| 04 | Integration methods | `notebooks/04_integration_methods.Rmd` |
-| 05 | Evaluation and wrap-up | `notebooks/05_evaluation.Rmd` |
-
 ## Getting started
 
 1. Clone the repository:
